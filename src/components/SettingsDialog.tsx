@@ -1,15 +1,17 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { cloneElement, isValidElement, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import * as api from "../api";
-import { useUi, READER_BOUNDS, type OpenMode } from "../store";
+import { useUi, READER_BOUNDS, SIDEBAR_FONT_BOUNDS, type OpenMode } from "../store";
 import { useArticleActions } from "../hooks/articleActions";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { LANGUAGES, setLanguage, type Language } from "../i18n";
 import { feedHost } from "../lib/feedMeta";
-import { modKey, modCombo } from "../lib/platform";
+import { isMobile, modKey, modCombo } from "../lib/platform";
 import { reportError } from "../toast";
 import { checkForUpdates } from "../lib/updater";
 import { saveTextFile } from "../lib/save";
@@ -113,6 +115,10 @@ export default function SettingsDialog({
         aria-label={t("settings.title")}
         onClick={(e) => e.stopPropagation()}
       >
+        {isMobile && <div className="settings-mobile-nav">
+          <span>{t("settings.title")}</span>
+          <Select value={section} aria-label={t("mobile.settingsSection")} options={SECTIONS.map((s) => ({ value: s.id, label: t(s.labelKey) }))} onChange={setSection} />
+        </div>}
         <div className="settings-sidebar">
           <div className="settings-sidebar-title">
             {t("settings.title")}
@@ -228,16 +234,19 @@ function Select<T extends string>({
   value,
   options,
   onChange,
+  disabled,
   "aria-label": ariaLabel,
 }: {
   value: T;
   options: { value: T; label: string }[];
   onChange: (v: T) => void;
+  disabled?: boolean;
   "aria-label"?: string;
 }) {
   return (
     <select
       className="s-select"
+      disabled={disabled}
       value={value}
       aria-label={ariaLabel}
       onChange={(e) => onChange(e.target.value as T)}
@@ -522,7 +531,7 @@ function GeneralSection() {
       </div>
       <div className="settings-group">
         <h3 className="settings-group-title">{t("settings.general.startup")}</h3>
-        <LaunchAtLogin />
+        {!isMobile && <LaunchAtLogin />}
         <Row
           label={t("settings.general.startupView")}
           desc={t("settings.general.startupViewDesc")}
@@ -554,6 +563,8 @@ function AppearanceSection() {
   const { t, i18n } = useTranslation();
   const palette = useUi((s) => s.palette);
   const setPalette = useUi((s) => s.setPalette);
+  const sidebarFontSize = useUi((s) => s.sidebarFontSize);
+  const setSidebarFontSize = useUi((s) => s.setSidebarFontSize);
   const mode = useUi((s) => s.mode);
   const setMode = useUi((s) => s.setMode);
   const density = useUi((s) => s.density);
@@ -584,15 +595,20 @@ function AppearanceSection() {
           label={t("settings.appearance.palette")}
           desc={t("settings.appearance.paletteDesc")}
         >
-          <Segmented
-            value={palette}
-            options={[
-              { value: "paper", label: t("settings.appearance.palettePaper") },
-              { value: "frost", label: t("settings.appearance.paletteFrost") },
-              { value: "contrast", label: t("settings.appearance.paletteContrast") },
-            ]}
-            onChange={setPalette}
-          />
+          <div className="s-theme-options" role="group" aria-label={t("settings.appearance.palette")}>
+            {([
+              ["paper", "palettePaper", "#FBF9F3"], ["frost", "paletteFrost", "#FFFFFF"],
+              ["contrast", "paletteContrast", "#D4D4D4"], ["mint", "paletteMint", "#EEF4E8"],
+              ["sepia", "paletteSepia", "#F4E8C9"], ["gray", "paletteGray", "#ECEDED"],
+              ["black", "paletteBlack", "#000000"],
+            ] as const).map(([value, label, color]) => (
+              <button type="button" key={value} className="s-theme-option" aria-pressed={palette === value}
+                onClick={() => { setPalette(value); if (value === "black") setMode("dark"); else if (["mint", "sepia", "gray"].includes(value)) setMode("light"); }}>
+                <span className="s-theme-swatch" style={{ background: color }} aria-hidden="true" />
+                {t(`settings.appearance.${label}`)}
+              </button>
+            ))}
+          </div>
         </Row>
         <Row
           label={t("settings.appearance.appearance")}
@@ -611,6 +627,10 @@ function AppearanceSection() {
       </div>
       <div className="settings-group">
         <h3 className="settings-group-title">{t("settings.appearance.layout")}</h3>
+        <Row label={t("settings.appearance.sidebarFontSize")} desc={t("settings.appearance.sidebarFontSizeDesc")}>
+          <Slider value={sidebarFontSize} min={SIDEBAR_FONT_BOUNDS.min} max={SIDEBAR_FONT_BOUNDS.max} unit="px"
+            aria-label={t("settings.appearance.sidebarFontSize")} onChange={setSidebarFontSize} />
+        </Row>
         <Row
           label={t("settings.appearance.density")}
           desc={t("settings.appearance.densityDesc")}
@@ -699,6 +719,7 @@ function ReadingSection() {
         <Row label={t("settings.reading.fontSize")}>
           <Slider
             value={readerSize}
+            aria-label={t("settings.reading.fontSize")}
             min={READER_BOUNDS.size.min}
             max={READER_BOUNDS.size.max}
             unit="px"
@@ -1033,6 +1054,114 @@ function RsshubInstanceGroup() {
   );
 }
 
+function WebDavSection({ onToast }: { onToast: (m: string) => void }) {
+  const { t, i18n } = useTranslation();
+  const qc = useQueryClient();
+  const actions = useArticleActions();
+  const status = useQuery({ queryKey: ["webdav-status"], queryFn: api.webdavStatus, refetchInterval: 15_000 });
+  const conflicts = useQuery({ queryKey: ["webdav-conflicts"], queryFn: api.webdavConflicts, refetchInterval: 15_000 });
+  const resolve = async (c: api.WebDavConflict, choice: "local" | "remote" | "newer" | "root") => {
+    setBusy(true);
+    try {
+      await api.webdavResolve(c.kind, c.key, choice);
+      actions.refreshAfterFetch();
+      await Promise.all([qc.invalidateQueries({queryKey:["webdav-conflicts"]}), qc.invalidateQueries({queryKey:["webdav-status"]})]);
+    } catch(e) { reportError(e); } finally {setBusy(false);}
+  };
+  const versionText = (r: api.WebDavRecord) => {
+    if (r.kind === "ai_prompt") return String(r.data.prompt || t("settings.summaryPrompt.defaultLabel"));
+    if (r.kind === "ai_config") return `${r.data.provider} · ${r.data.model || t("settings.codex.defaultModel")}\n${t("settings.codex.effort")}: ${r.data.effort || t("settings.codex.defaultEffort")}`;
+    if (r.deleted) return t("settings.webdav.deleted");
+    if (r.kind === "reading_progress") return `${Math.round(Number(r.data.reading_progress) * 100)}%`;
+    if (["is_read", "is_starred", "read_later"].includes(r.kind)) return t(r.data[r.kind] ? "settings.webdav.on" : "settings.webdav.off");
+    return JSON.stringify(r.data, null, 2);
+  };
+  const [url, setUrl] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [operation, setOperation] = useState<"connect" | "sync" | "disconnect" | null>(null);
+  const run = async (operation: "connect" | "sync" | "disconnect") => {
+    setBusy(true);
+    setOperation(operation);
+    try {
+      if (operation === "connect") {
+        await api.webdavConnect(url.trim(), username.trim(), password);
+        setPassword("");
+        onToast(t("settings.sync.connected"));
+      } else if (operation === "disconnect") {
+        await api.webdavDisconnect();
+        onToast(t("settings.sync.disconnected"));
+      } else {
+        await api.webdavSync();
+        onToast(t("settings.webdav.done"));
+      }
+    } catch (e) {
+      reportError(e);
+    } finally {
+      await qc.invalidateQueries({ queryKey: ["webdav-status"] });
+      await qc.invalidateQueries({ queryKey: ["webdav-conflicts"] });
+      if (operation === "sync") actions.refreshAfterFetch();
+      setBusy(false);
+      setOperation(null);
+    }
+  };
+  return (
+    <div className="settings-group">
+      <h3 className="settings-group-title">WebDAV</h3>
+      <p className="modal-hint" style={{ marginBottom: 14 }}>{t("settings.webdav.hint")}</p>
+      {status.isError && <p role="alert" className="modal-hint">{errorText(status.error)}</p>}
+      {status.data?.connected ? (
+        <>
+          <div className="s-service">
+            <div className="logo">W</div>
+            <div className="info"><div className="title">WebDAV</div><div className="desc">{status.data.url}</div></div>
+            <span className="status on">{t("settings.sync.statusConnected")}</span>
+          </div>
+          <p className="modal-hint">
+            {status.data.lastSync ? t("settings.webdav.lastSync", { time: new Date(status.data.lastSync).toLocaleString(i18n.language) }) : t("settings.webdav.neverSynced")}
+          </p>
+          {status.data.lastError && <p role="alert" className="modal-hint">{t(`error.${status.data.lastError}`)}</p>}
+          {conflicts.isError && <p className="ai-test-err" role="alert">{errorText(conflicts.error)}</p>}
+          {(conflicts.data?.length ?? 0) > 0 && <div className="webdav-conflicts">
+            <p role="status">{t("settings.webdav.conflictHint", { count: conflicts.data!.length })}</p>
+            {conflicts.data!.map((c) => <div className="webdav-conflict" key={`${c.kind}:${c.key}`}>
+              <strong>{t(`settings.webdav.kinds.${c.kind}`, { defaultValue: c.kind })} · {c.title}</strong>
+              {["cycle", "missingParent"].includes(c.reason) && <p className="modal-hint">{t(c.reason === "missingParent" ? "settings.webdav.missingParent" : "settings.webdav.cycle")}</p>}
+              <div className="webdav-versions">
+                {(["local", "remote"] as const).map((side) => <div key={side}><span>{t(`settings.webdav.${side}`)}</span><pre>{versionText(c[side])}</pre></div>)}
+              </div>
+              <div className="codex-actions">
+                <button className="s-btn" disabled={busy} onClick={() => { void resolve(c, "local"); }}>{t("settings.webdav.keepLocal")}</button>
+                <button className="s-btn" disabled={busy} onClick={() => { void resolve(c, "remote"); }}>{t("settings.webdav.keepRemote")}</button>
+                {["cycle", "missingParent"].includes(c.reason) ? <button className="s-btn" disabled={busy} onClick={() => { void resolve(c, "root"); }}>{t("settings.webdav.moveRoot")}</button> : <button className="s-btn" disabled={busy} onClick={() => { void resolve(c, "newer"); }}>{t("settings.webdav.keepNewer")}</button>}
+              </div>
+            </div>)}
+          </div>}
+          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+            <button className="s-btn primary" disabled={busy} onClick={() => run("sync")}>
+              <Icon name="refresh" size={12} /> {operation === "sync" ? t("settings.sync.syncing") : t("settings.sync.syncNow")}
+            </button>
+            <button className="s-btn" disabled={busy} onClick={() => run("disconnect")}>{t("settings.sync.disconnect")}</button>
+          </div>
+        </>
+      ) : (
+        <form onSubmit={(e) => { e.preventDefault(); void run("connect"); }} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <input className="modal-input" style={{ margin: 0 }} type="url" required disabled={busy || status.isPending} value={url} onChange={(e) => setUrl(e.target.value)}
+            aria-label={t("settings.webdav.url")} placeholder={t("settings.webdav.url")} {...NO_AUTOCORRECT} />
+          <input className="modal-input" style={{ margin: 0 }} disabled={busy} value={username} onChange={(e) => setUsername(e.target.value)}
+            aria-label={t("settings.sync.userPlaceholder")} placeholder={t("settings.sync.userPlaceholder")} {...NO_AUTOCORRECT} autoComplete="username" />
+          <input className="modal-input" style={{ margin: 0 }} disabled={busy} type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)}
+            aria-label={t("settings.sync.passPlaceholder")} placeholder={t("settings.sync.passPlaceholder")} />
+          <div><button type="submit" className="s-btn primary" disabled={busy || status.isPending || !url.trim()}>
+            {operation === "connect" ? t("settings.sync.connecting") : t("settings.sync.connect")}
+          </button></div>
+        </form>
+      )}
+    </div>
+  );
+}
+
 /* ── sync ────────────────────────────────────────────────── */
 function SyncSection({ onToast }: { onToast: (m: string) => void }) {
   const { t } = useTranslation();
@@ -1224,6 +1353,8 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
           </>
         )}
       </div>
+
+      <WebDavSection onToast={onToast} />
 
       <div className="settings-group">
         <h3 className="settings-group-title">{t("settings.sync.otherServices")}</h3>
@@ -1599,7 +1730,7 @@ function DangerZone({ onToast }: { onToast: (m: string) => void }) {
             // "theme" is the pre-6-theme key; still cleared so a reset wipes it
             // for migrated installs. "palette"/"mode" are the current keys.
             "palette", "mode", "theme", "accent", "darkShade", "density", "viewMode", "readerFont",
-            "useSerif", "readerSize", "readerLeading", "readerWidth",
+            "useSerif", "readerSize", "readerLeading", "readerWidth", "sidebarFontSize",
             "collapsedFolders",
           ].includes(k)
         ) {
@@ -1663,12 +1794,140 @@ function DangerZone({ onToast }: { onToast: (m: string) => void }) {
   );
 }
 
+function useWebdavRefresh(refresh: () => Promise<void>) {
+  const latest = useRef(refresh);
+  latest.current = refresh;
+  useEffect(() => {
+    let active = true;
+    const unlisten = listen("webdav-updated", () => { if (active) void latest.current().catch(reportError); });
+    return () => { active = false; void unlisten.then((off) => off()); };
+  }, []);
+}
+
+function CodexAccount({ model, onModel }: { model: string; onModel: (value: string) => Promise<void> }) {
+  const { t } = useTranslation();
+  const [status, setStatus] = useState<api.CodexStatus | null>(null);
+  const [models, setModels] = useState<api.CodexModel[]>([]);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [effort, setEffort] = useState("");
+  useWebdavRefresh(async () => { const config = await api.getAiPreferences(); setEffort(config.effort); });
+  const chosenModel = models.find((m) => model ? m.id === model : m.isDefault);
+  useEffect(() => { api.getSetting("ai_reasoning_effort_codex").then((v) => setEffort(v || "")).catch(reportError); }, []);
+  const [loginUrl, setLoginUrl] = useState("");
+  const refresh = async () => {
+    try { const s = await api.codexStatus(); setStatus(s); setError(s.error || ""); return s; }
+    catch (e) { setError(errorText(e)); return null; }
+  };
+  useEffect(() => {
+    let active = true;
+    const update = async () => {
+      try {
+        const s = await api.codexStatus();
+        if (active) { setStatus(s); setError(s.error || ""); }
+      } catch (e) { if (active) setError(errorText(e)); }
+    };
+    void update();
+    const timer = window.setInterval(() => { void update(); }, 3000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
+  useEffect(() => {
+    let active = true;
+    if (status?.loggedIn) api.codexModels().then((m) => { if (active) setModels(m); }).catch((e) => { if (active) setError(errorText(e)); });
+    else setModels([]);
+    return () => { active = false; };
+  }, [status?.loggedIn]);
+  const action = async (run: () => Promise<unknown>) => {
+    setBusy(true); setError("");
+    try { await run(); await refresh(); } catch (e) { setError(errorText(e)); }
+    finally { setBusy(false); }
+  };
+  return <>
+    <Row label={t("settings.codex.account")} desc={t("settings.codex.description")}>
+      <div className="codex-account-control">
+        <span className={status?.loggedIn ? "codex-status connected" : "codex-status"} role="status">{status?.loggedIn ? status.email || "ChatGPT" : t(status?.pending ? "settings.codex.waiting" : "settings.codex.signedOut")}</span>
+        <div className="codex-actions">
+          {status?.loggedIn ? <button className="s-btn" disabled={busy} onClick={() => { void action(async () => { await api.codexLogout(); setLoginUrl(""); }); }}>{t("settings.codex.logout")}</button> :
+            <button className="s-btn" disabled={busy || status?.pending} onClick={() => { void action(async () => { const url = await api.codexLogin(); setLoginUrl(url); await openUrl(url); }); }}>{t("settings.codex.login")}</button>}
+          {status?.pending && <button className="s-btn" disabled={busy} onClick={() => { void action(async () => { await api.codexCancelLogin(); setLoginUrl(""); }); }}>{t("common.cancel")}</button>}
+          {status?.pending && loginUrl && <button className="s-btn" onClick={() => { void openUrl(loginUrl).catch(reportError); }}>{t("settings.codex.reopen")}</button>}
+        </div>
+      </div>
+    </Row>
+    <Row label={t("settings.advanced.aiModel")} desc={t(status?.loggedIn ? "settings.advanced.aiModelDesc" : "settings.codex.modelAfterLogin")}>
+      <Select value={model} disabled={!status?.loggedIn || busy} aria-label={t("settings.advanced.aiModel")} options={[
+        { value: "", label: t("settings.codex.defaultModel") },
+        ...(model && !models.some((m) => m.id === model) ? [{ value: model, label: model }] : []),
+        ...models.map((m) => ({ value: m.id, label: m.name })),
+      ]} onChange={(value) => {
+        void action(async () => { await onModel(value); setEffort(""); });
+      }} />
+    </Row>
+    <Row label={t("settings.codex.effort")} desc={t("settings.codex.effortDesc")}>
+      <Select value={effort} disabled={!status?.loggedIn || busy || !chosenModel} options={[
+        { value: "", label: t("settings.codex.defaultEffort") },
+        ...(effort && !chosenModel?.reasoningEfforts.includes(effort) ? [{ value: effort, label: t(`settings.codex.efforts.${effort}`, { defaultValue: effort }) }] : []),
+        ...(chosenModel?.reasoningEfforts || []).map((value) => ({ value, label: t(`settings.codex.efforts.${value}`, { defaultValue: value }) })),
+      ]} onChange={(value) => { void action(async () => { await api.setSetting("ai_reasoning_effort_codex", value); setEffort(value); }); }} />
+    </Row>
+    {error && <p className="ai-test-err codex-account-error" role="alert">{error}</p>}
+  </>;
+
+}
+
+function SummaryPromptEditor({ onToast }: { onToast: (message: string) => void }) {
+  const { t } = useTranslation();
+  const [prompt, setPrompt] = useState("");
+  const [saved, setSaved] = useState("");
+  const [defaultPrompt, setDefaultPrompt] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const savedRef = useRef(saved);
+  savedRef.current = saved;
+  useWebdavRefresh(async () => {
+    const config = await api.getSummaryPrompt();
+    const previous = savedRef.current;
+    setPrompt((draft) => draft === previous ? config.prompt : draft);
+    setSaved(config.prompt); setDefaultPrompt(config.defaultPrompt);
+  });
+  useEffect(() => {
+    let active = true;
+    api.getSummaryPrompt().then((config) => {
+      if (!active) return;
+      setPrompt(config.prompt); setSaved(config.prompt); setDefaultPrompt(config.defaultPrompt);
+    }).catch((e) => { if (active) setError(errorText(e)); }).finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, []);
+  const persist = async (reset = false) => {
+    const next = reset ? defaultPrompt : prompt.trim() || defaultPrompt;
+    setBusy(true); setError("");
+    try {
+      await api.saveSummaryPrompt(reset || next === defaultPrompt ? "" : next);
+      setPrompt(next); setSaved(next);
+      onToast(t(reset ? "settings.summaryPrompt.restored" : "settings.summaryPrompt.saved"));
+    } catch (e) { setError(errorText(e)); }
+    finally { setBusy(false); }
+  };
+  return <div className="summary-prompt-editor">
+    <label className="settings-row-label" htmlFor="ai-summary-prompt">{t("settings.summaryPrompt.title")}</label>
+    <p id="ai-summary-prompt-hint" className="settings-row-desc">{t("settings.summaryPrompt.hint")}</p>
+    <textarea id="ai-summary-prompt" value={prompt} disabled={loading || busy || !defaultPrompt} maxLength={12000} rows={10} aria-describedby="ai-summary-prompt-hint" spellCheck={false} onChange={(e) => setPrompt(e.target.value)} />
+    <div className="summary-prompt-actions">
+      <button className="s-btn primary" disabled={loading || busy || !defaultPrompt || prompt === saved} onClick={() => { void persist(); }}>{t(busy ? "settings.summaryPrompt.saving" : "settings.summaryPrompt.save")}</button>
+      <button className="s-btn" disabled={loading || busy || !defaultPrompt || (prompt === defaultPrompt && saved === defaultPrompt)} onClick={() => { void persist(true); }}>{t("settings.summaryPrompt.reset")}</button>
+      {prompt !== saved && <span className="settings-row-desc" role="status">{t("settings.summaryPrompt.unsaved")}</span>}
+    </div>
+    {error && <p className="ai-test-err" role="alert">{error}</p>}
+  </div>;
+}
+
 /** The default article-translation engine. "llm" reuses the AI provider
  *  configured for summaries; the rest are standalone machine-translation
  *  services. The reader can override this per translation, but only temporarily. */
 type TranslateEngine = "llm" | "google" | "deepl" | "bing";
 
-type AiProvider = "anthropic" | "openai" | "deepseek";
+type AiProvider = "anthropic" | "openai" | "deepseek" | "codex";
 
 /** Real AI provider configuration — backing the AI summary feature, plus the
  *  default translation engine + language and the engines' credentials. */
@@ -1686,6 +1945,7 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
   const savedKey = useRef("");
   const savedModel = useRef("");
   const savedBaseUrl = useRef("");
+  const [remotePending, setRemotePending] = useState(false);
   // Connection test: one minimal request, plus the verdict to show inline.
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{
@@ -1743,10 +2003,24 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
     profileQueue.current = next.catch(() => {});
     return next;
   };
-  const saveProfile = (nextModel: string, nextBaseUrl: string) => {
-    enqueueProfile(() => api.configureAiProvider(provider, nextModel, nextBaseUrl))
+  const reloadSyncedProfile = async () => {
+    const config = await api.getAiPreferences();
+    setProvider(config.provider as AiProvider);
+    setModel(config.model); savedModel.current = config.model;
+    setBaseUrl(config.baseUrl); savedBaseUrl.current = config.baseUrl;
+    setRemotePending(false);
+  };
+  useWebdavRefresh(async () => {
+    const config = await api.getAiPreferences();
+    if (config.provider === provider && config.model === savedModel.current && config.baseUrl === savedBaseUrl.current) return;
+    if (switching.current || model !== savedModel.current || baseUrl !== savedBaseUrl.current) {
+      setRemotePending(true);
+    } else await reloadSyncedProfile();
+  });
+  const saveProfile = (nextModel: string, nextBaseUrl: string, effort?: string) => {
+    return enqueueProfile(() => api.configureAiProvider(provider, nextModel, nextBaseUrl, effort))
       .then(() => { savedModel.current = nextModel; savedBaseUrl.current = nextBaseUrl; })
-      .catch(reportError);
+      .catch((e) => { reportError(e); throw e; });
   };
   const loadProviderProfile = async (p: AiProvider) => {
     if (switching.current) return;
@@ -1778,7 +2052,7 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
       api.getSetting("translate_target_lang"),
     ])
       .then(([p, k, m, b, eng, tl]) => {
-        if (p === "openai" || p === "anthropic" || p === "deepseek")
+        if (p === "openai" || p === "anthropic" || p === "deepseek" || p === "codex")
           setProvider(p);
         if (k) {
           setApiKey(k);
@@ -1824,6 +2098,8 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
   return (
     <div className="settings-group">
       <h3 className="settings-group-title">{t("settings.advanced.aiSummary")}</h3>
+      <p className="modal-hint">{t("settings.advanced.aiSyncHint")}</p>
+      {remotePending && <div role="status" className="modal-hint">{t("settings.advanced.aiSyncDraft")} <button className="s-btn" disabled={profileBusy} onClick={() => { void reloadSyncedProfile().catch(reportError); }}>{t("settings.advanced.aiSyncReload")}</button> <button className="s-btn" disabled={profileBusy} onClick={() => { void saveProfile(model.trim(), baseUrl.trim()).then(() => setRemotePending(false)).catch(() => {}); }}>{t("settings.advanced.aiSyncKeep")}</button></div>}
       <fieldset disabled={profileBusy} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
       <Row
         label={t("settings.advanced.aiProvider")}
@@ -1831,14 +2107,17 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
       >
         <Select
           value={provider}
+          disabled={remotePending}
           options={[
             { value: "anthropic", label: "Anthropic" },
             { value: "openai", label: "OpenAI" },
             { value: "deepseek", label: "DeepSeek" },
+            ...(!isMobile || provider === "codex" ? [{ value: "codex", label: "Codex / ChatGPT" }] : []),
           ]}
-          onChange={(v) => { void loadProviderProfile(v); }}
+          onChange={(v) => { void loadProviderProfile(v as AiProvider); }}
         />
       </Row>
+      {provider !== "codex" && <>
       <Row
         label={t("settings.advanced.aiApiKey")}
         desc={t("settings.advanced.aiApiKeyDesc")}
@@ -1862,6 +2141,8 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           }}
         />
       </Row>
+      </>}
+      {provider === "codex" ? (isMobile ? <p role="status" className="modal-hint">{t("error.codexMobileUnsupported")}</p> : <CodexAccount model={model} onModel={async (v) => { await saveProfile(v, "", ""); setModel(v); }} />) : <>
       <Row
         label={t("settings.advanced.aiModel")}
         desc={t("settings.advanced.aiModelDesc")}
@@ -1876,15 +2157,18 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           onBlur={() => {
             // Trim before persisting — a pasted model name with a stray
             // space / newline yields a "model not found" from the provider.
+            if (remotePending) return;
             const trimmed = model.trim();
             if (trimmed !== model) setModel(trimmed);
             if (trimmed !== savedModel.current) {
-              saveProfile(trimmed, baseUrl.trim());
+              void saveProfile(trimmed, baseUrl.trim()).catch(() => {});
             }
 
           }}
         />
       </Row>
+      </>}
+      {provider !== "codex" && <>
       <Row
         label={t("settings.advanced.aiBaseUrl")}
         desc={t("settings.advanced.aiBaseUrlDesc")}
@@ -1897,15 +2181,17 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           placeholder={baseUrlPlaceholder}
           onChange={(e) => setBaseUrl(e.target.value)}
           onBlur={() => {
+            if (remotePending) return;
             const trimmed = baseUrl.trim();
             if (trimmed !== baseUrl) setBaseUrl(trimmed);
             if (trimmed !== savedBaseUrl.current) {
-              saveProfile(model.trim(), trimmed);
+              void saveProfile(model.trim(), trimmed).catch(() => {});
             }
 
           }}
         />
       </Row>
+      </>}
       </fieldset>
       <Row
         label={t("settings.advanced.aiTest")}
@@ -1915,7 +2201,7 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           <button
             className="s-btn"
             type="button"
-            disabled={profileBusy || testing || !apiKey.trim()}
+            disabled={profileBusy || testing || (provider !== "codex" && !apiKey.trim())}
             onClick={runTest}
           >
             {testing
@@ -1932,6 +2218,7 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           )}
         </div>
       </Row>
+      <SummaryPromptEditor onToast={onToast} />
       <Row
         label={t("settings.advanced.translateEngine")}
         desc={t("settings.advanced.translateEngineDesc")}
@@ -2337,9 +2624,9 @@ function AboutSection() {
       <div className="version">
         Version{version && ` ${version}`}
       </div>
-      <button className="s-btn about-update" onClick={onCheck} disabled={checking}>
+      {!isMobile && <button className="s-btn about-update" onClick={onCheck} disabled={checking}>
         {checking ? t("update.checking") : t("update.checkButton")}
-      </button>
+      </button>}
       <p className="credits">
         {t("settings.about.creditsFonts")}
         <br />

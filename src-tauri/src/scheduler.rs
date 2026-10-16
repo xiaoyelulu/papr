@@ -58,6 +58,18 @@ pub async fn refresh_all(
     })
     .await?;
 
+    // Reading state must sync even when no subscription is due for refresh.
+    match papr_core::webdav::run_if_connected(&state.db, &client).await {
+        Ok(false) => {},
+        result => {
+            let _ = app.emit("feeds-updated", 0);
+            let _ = app.emit("webdav-updated", ());
+            notify::update_badge(app).await;
+            tray::refresh(app).await;
+            if let Err(e) = result { log::warn!("WebDAV sync failed: {e}"); }
+        }
+    }
+
     // Background scheduler with nothing due this cycle: bow out before the
     // heavier tail (sync, notifications, tray) so an idle tick is genuinely idle.
     if !summary.ran {

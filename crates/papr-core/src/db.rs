@@ -1,6 +1,10 @@
 //! SQLite data layer. One file holds feeds, articles, FTS5 index and settings.
 //! All SQL lives here; commands call typed functions, never raw SQL.
 
+pub mod webdav;
+#[cfg(test)]
+mod folder_tests;
+
 use crate::error::{AppError, AppResult};
 use crate::models::*;
 use rusqlite::functions::FunctionFlags;
@@ -305,6 +309,11 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
         // databases remain readable without resetting or discarding data.
         M::up("ALTER TABLE feeds ADD COLUMN custom_favicon INTEGER NOT NULL DEFAULT 0;"),
         M::up("ALTER TABLE feeds ADD COLUMN position INTEGER NOT NULL DEFAULT 0;"),
+        M::up(webdav::schema()),
+        M::up(webdav::folder_schema()),
+        M::up(webdav::tag_schema()),
+        M::up(webdav::scoped_tag_schema()),
+        M::up(webdav::ai_preferences_schema()),
     ])
 });
 
@@ -363,13 +372,14 @@ pub fn open_reader(path: &Path) -> AppResult<Connection> {
 
 pub fn list_folders(conn: &Connection) -> AppResult<Vec<Folder>> {
     let mut stmt =
-        conn.prepare("SELECT id, name, position FROM folders ORDER BY position, name")?;
+        conn.prepare("SELECT id, name, position, parent_id FROM folders ORDER BY position, name")?;
     let rows = stmt
         .query_map([], |r| {
             Ok(Folder {
                 id: r.get(0)?,
                 name: r.get(1)?,
                 position: r.get(2)?,
+                parent_id: r.get(3)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -386,6 +396,13 @@ pub fn list_folders(conn: &Connection) -> AppResult<Vec<Folder>> {
 /// folder whose name already exists must land in *that* folder rather than a
 /// freshly created twin. This mirrors `create_tag`'s case-insensitive dedup.
 pub fn create_folder(conn: &Connection, name: &str) -> AppResult<i64> {
+    create_folder_in(conn, name, None)
+}
+
+pub fn create_folder_in(conn: &Connection, name: &str, parent_id: Option<i64>) -> AppResult<i64> {
+    if let Some(parent) = parent_id {
+        conn.query_row("SELECT id FROM folders WHERE id=?1", [parent], |r| r.get::<_,i64>(0))?;
+    }
     // Trim before the dedup lookup and the insert: a name carrying surrounding
     // whitespace (a pasted OPML `<outline text=" Tech ">`, an accidental
     // trailing space) is a different string from its trimmed twin, so the
@@ -412,11 +429,13 @@ pub fn create_folder(conn: &Connection, name: &str) -> AppResult<i64> {
         )
         .optional()?
     {
+        let existing_parent: Option<i64> = conn.query_row("SELECT parent_id FROM folders WHERE id=?1", [id], |r| r.get(0))?;
+        if parent_id.is_some() && existing_parent != parent_id { return Err(AppError::code("folderNameExists")); }
         return Ok(id);
     }
     conn.execute(
-        "INSERT INTO folders(name, position) VALUES (?1, (SELECT COALESCE(MAX(position),0)+1 FROM folders))",
-        params![name],
+        "INSERT INTO folders(name, position, parent_id) VALUES (?1, (SELECT COALESCE(MAX(position),0)+1 FROM folders), ?2)",
+        params![name, parent_id],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -455,8 +474,34 @@ pub fn rename_folder(conn: &Connection, id: i64, name: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Move a folder without allowing self-parenting or cycles. Child folders
+/// keep their subscriptions; deleting a parent promotes its children to root.
+pub fn move_folder(conn: &Connection, id: i64, parent_id: Option<i64>) -> AppResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.query_row("SELECT id FROM folders WHERE id=?1", [id], |r| r.get::<_,i64>(0))?;
+    if let Some(parent) = parent_id {
+        tx.query_row("SELECT id FROM folders WHERE id=?1", [parent], |r| r.get::<_,i64>(0))?;
+        let cycle: bool = tx.query_row(
+            "WITH RECURSIVE subtree(id) AS (SELECT ?1 UNION SELECT f.id FROM folders f JOIN subtree s ON f.parent_id=s.id) SELECT EXISTS(SELECT 1 FROM subtree WHERE id=?2)",
+            params![id,parent], |r| r.get(0))?;
+        if cycle { return Err(AppError::code("folderCycle")); }
+    }
+    tx.execute("UPDATE folders SET parent_id=?2 WHERE id=?1", params![id,parent_id])?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn delete_folder(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Delete a complete folder subtree and its subscriptions/articles atomically.
+pub fn delete_folder_with_feeds(conn: &Connection, id: i64) -> AppResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM feeds WHERE folder_id IN (WITH RECURSIVE subtree(id) AS (SELECT ?1 UNION SELECT f.id FROM folders f JOIN subtree s ON f.parent_id=s.id) SELECT id FROM subtree)", [id])?;
+    tx.execute("DELETE FROM folders WHERE id IN (WITH RECURSIVE subtree(id) AS (SELECT ?1 UNION SELECT f.id FROM folders f JOIN subtree s ON f.parent_id=s.id) SELECT id FROM subtree)", [id])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -620,7 +665,7 @@ pub fn feeds_to_refresh_in_folder(
 ) -> AppResult<Vec<FeedToRefresh>> {
     let mut stmt = conn.prepare(
         "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type != 'newsletter' AND folder_id = ?1",
+         WHERE source_type != 'newsletter' AND folder_id IN (WITH RECURSIVE subtree(id) AS (SELECT ?1 UNION SELECT f.id FROM folders f JOIN subtree s ON f.parent_id=s.id) SELECT id FROM subtree)",
     )?;
     let rows = stmt
         .query_map(params![folder_id], |r| {
@@ -788,6 +833,12 @@ pub fn feed_urls_for_sync(conn: &Connection) -> AppResult<Vec<String>> {
 /// near-duplicate.
 pub fn folder_id_by_name(conn: &Connection, name: &str) -> AppResult<i64> {
     create_folder(conn, name)
+}
+
+pub fn folder_id_by_path(conn: &Connection, path: &[String]) -> AppResult<Option<i64>> {
+    let mut parent = None;
+    for name in path { parent = Some(create_folder_in(conn, name, parent)?); }
+    Ok(parent)
 }
 
 pub fn move_feed(conn: &Connection, id: i64, folder_id: Option<i64>) -> AppResult<()> {
@@ -987,7 +1038,7 @@ pub fn newsletter_sources_in_folder(
     let mut stmt = conn.prepare(
         "SELECT s.feed_id, s.host, s.port, s.username, s.password, s.folder
          FROM newsletter_sources s JOIN feeds f ON f.id = s.feed_id
-         WHERE f.folder_id = ?1",
+         WHERE f.folder_id IN (WITH RECURSIVE subtree(id) AS (SELECT ?1 UNION SELECT f.id FROM folders f JOIN subtree s ON f.parent_id=s.id) SELECT id FROM subtree)",
     )?;
     let rows = stmt
         .query_map(params![folder_id], |r| {
@@ -1176,12 +1227,12 @@ fn article_filter(query: &ArticleQuery, unread_only: bool) -> (Vec<String>, Vec<
             binds.push(Value::Integer(*id));
         }
         ArticleQuery::Folder(id) => {
-            where_clauses.push("f.folder_id = ?".into());
+            where_clauses.push("f.folder_id IN (WITH RECURSIVE subtree(id) AS (SELECT ? UNION SELECT f.id FROM folders f JOIN subtree s ON f.parent_id=s.id) SELECT id FROM subtree)".into());
             binds.push(Value::Integer(*id));
         }
         ArticleQuery::Tag(id) => {
             where_clauses.push(
-                "a.id IN (SELECT article_id FROM article_tags WHERE tag_id = ?)".into(),
+                "a.id IN (SELECT article_id FROM article_tags WHERE tag_id IN (WITH RECURSIVE subtree(id) AS (SELECT ? UNION SELECT t.id FROM tags t JOIN subtree s ON t.parent_id=s.id) SELECT id FROM subtree))".into(),
             );
             binds.push(Value::Integer(*id));
         }
@@ -1427,7 +1478,7 @@ pub fn get_article(conn: &Connection, id: i64) -> AppResult<ArticleDetail> {
         "SELECT a.id, a.feed_id, f.title, f.source_type, a.title, a.author, a.url,
                 a.content_html, a.extracted_html, a.image_url, a.published_at,
                 a.is_read, a.is_starred, a.read_later, a.ai_summary,
-                a.translated_html, a.translated_lang
+                a.translated_html, a.translated_lang, a.reading_progress
          FROM articles a JOIN feeds f ON f.id = a.feed_id WHERE a.id = ?1",
         params![id],
         |r| {
@@ -1449,6 +1500,7 @@ pub fn get_article(conn: &Connection, id: i64) -> AppResult<ArticleDetail> {
                 ai_summary: r.get(14)?,
                 translated_html: r.get(15)?,
                 translated_lang: r.get(16)?,
+                reading_progress: r.get(17)?,
                 enclosures: Vec::new(),
                 tags: Vec::new(),
             })
@@ -1607,11 +1659,11 @@ pub fn mark_all_read(
         ArticleQuery::ReadLater => ("read_later = 1", None),
         ArticleQuery::Feed(id) => ("feed_id = ?1", Some(*id)),
         ArticleQuery::Folder(id) => (
-            "feed_id IN (SELECT id FROM feeds WHERE folder_id = ?1)",
+            "feed_id IN (SELECT id FROM feeds WHERE folder_id IN (WITH RECURSIVE subtree(id) AS (SELECT ?1 UNION SELECT f.id FROM folders f JOIN subtree s ON f.parent_id=s.id) SELECT id FROM subtree))",
             Some(*id),
         ),
         ArticleQuery::Tag(id) => (
-            "id IN (SELECT article_id FROM article_tags WHERE tag_id = ?1)",
+            "id IN (SELECT article_id FROM article_tags WHERE tag_id IN (WITH RECURSIVE subtree(id) AS (SELECT ?1 UNION SELECT t.id FROM tags t JOIN subtree s ON t.parent_id=s.id) SELECT id FROM subtree))",
             Some(*id),
         ),
     };
@@ -1671,7 +1723,7 @@ const TAG_COLORS: &[&str] = &[
 pub fn list_tags(conn: &Connection) -> AppResult<Vec<Tag>> {
     let mut stmt = conn.prepare(
         "SELECT t.id, t.name, t.color, t.position,
-                (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id)
+                (SELECT COUNT(DISTINCT article_id) FROM article_tags at WHERE at.tag_id IN (WITH RECURSIVE subtree(id) AS (SELECT t.id UNION SELECT child.id FROM tags child JOIN subtree s ON child.parent_id=s.id) SELECT id FROM subtree)), t.parent_id
          FROM tags t ORDER BY t.position, t.name COLLATE NOCASE",
     )?;
     let rows = stmt
@@ -1682,6 +1734,7 @@ pub fn list_tags(conn: &Connection) -> AppResult<Vec<Tag>> {
                 color: r.get(2)?,
                 position: r.get(3)?,
                 article_count: r.get(4)?,
+                parent_id: r.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1699,6 +1752,40 @@ pub fn list_tags(conn: &Connection) -> AppResult<Vec<Tag>> {
 /// than silently diverging. An existing name returns that tag's id instead of
 /// erroring.
 pub fn create_tag(conn: &Connection, name: &str) -> AppResult<i64> {
+    create_tag_in(conn, name, None)
+}
+/// Create a single slash-separated hierarchy and return its leaf.
+pub fn create_tag_in(conn: &Connection, name: &str, parent_id: Option<i64>) -> AppResult<i64> {
+    if name.contains([';', '；']) { return Err(AppError::code("invalidTagPath")); }
+    Ok(create_tags_in(conn,name,parent_id)?[0])
+}
+
+/// Semicolons separate tags; slashes separate hierarchy segments. Create the
+/// entire batch atomically and return only distinct leaf ids, in input order.
+pub fn create_tags_in(conn:&Connection, input:&str, parent_id:Option<i64>)->AppResult<Vec<i64>> {
+    let paths:Vec<Vec<_>>=input.split([';', '；']).map(str::trim).filter(|s|!s.is_empty()).map(|s|s.split('/').map(str::trim).collect()).collect();
+    if paths.is_empty() { return Err(AppError::code("tagNameEmpty")); }
+    if paths.len()>64 || paths.iter().any(|p|p.len()>32 || p.iter().any(|s|s.is_empty())) { return Err(AppError::code("invalidTagPath")); }
+    let tx=conn.unchecked_transaction()?;
+    let mut leaves=Vec::new();
+    for parts in paths {
+        let mut parent=parent_id;
+        for part in &parts {
+            let id=create_tag_segment(&tx,part,parent)?;
+            parent=Some(id);
+        }
+        let leaf=parent.unwrap();
+        if !leaves.contains(&leaf) {leaves.push(leaf);}
+    }
+    tx.commit()?;
+    Ok(leaves)
+}
+
+fn create_tag_segment(conn: &Connection, name: &str, parent_id: Option<i64>) -> AppResult<i64> {
+
+    if name.trim().is_empty() { return Err(AppError::code("tagNameEmpty")); }
+    if let Some(parent) = parent_id { if !conn.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE id=?1)",[parent],|r|r.get::<_,bool>(0))? { return Err(AppError::code("tagNotFound")); } }
+
     // Trim before the dedup lookup and the insert: a name with surrounding
     // whitespace is a distinct string from its trimmed twin, so the
     // `COLLATE NOCASE` lookup would miss the existing tag and spawn a
@@ -1707,8 +1794,8 @@ pub fn create_tag(conn: &Connection, name: &str) -> AppResult<i64> {
     let name = name.trim();
     if let Some(id) = conn
         .query_row(
-            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE",
-            params![name],
+            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE AND parent_id IS ?2",
+            params![name,parent_id],
             |r| r.get::<_, i64>(0),
         )
         .optional()?
@@ -1727,8 +1814,8 @@ pub fn create_tag(conn: &Connection, name: &str) -> AppResult<i64> {
     )?;
     let color = TAG_COLORS[(next as usize) % TAG_COLORS.len()];
     conn.execute(
-        "INSERT INTO tags(name, color, position) VALUES (?1, ?2, ?3)",
-        params![name, color, next],
+        "INSERT INTO tags(name, color, position, parent_id) VALUES (?1, ?2, ?3, ?4)",
+        params![name, color, next, parent_id],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -1736,7 +1823,7 @@ pub fn create_tag(conn: &Connection, name: &str) -> AppResult<i64> {
 /// Rename a tag, rejecting a name that collides with a *different* existing
 /// tag.
 ///
-/// `tags.name` is `UNIQUE` (case-sensitively). Without this guard a rename to a
+/// Tag names are unique within their parent. Without this guard a rename to a
 /// name that exactly matches another tag would fail the constraint and surface
 /// the raw SQLite message to the user; and a rename to a *case variant* of
 /// another tag ("rust" → "Rust") would succeed and create the near-duplicate
@@ -1751,7 +1838,7 @@ pub fn rename_tag(conn: &Connection, id: i64, name: &str) -> AppResult<()> {
     let name = name.trim();
     let clash: Option<i64> = conn
         .query_row(
-            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE AND id != ?2",
+            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE AND id != ?2 AND parent_id IS (SELECT parent_id FROM tags WHERE id=?2)",
             params![name, id],
             |r| r.get(0),
         )
@@ -1783,8 +1870,45 @@ pub fn reorder_tags(conn: &Connection, ids: &[i64]) -> AppResult<()> {
     Ok(())
 }
 
+pub fn move_tag(conn: &Connection, id: i64, parent_id: Option<i64>) -> AppResult<()> {
+    if !conn.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE id=?1)",[id],|r|r.get::<_,bool>(0))? { return Err(AppError::code("tagNotFound")); }
+    if let Some(parent) = parent_id {
+        if !conn.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE id=?1)",[parent],|r|r.get::<_,bool>(0))? { return Err(AppError::code("tagNotFound")); }
+        let cycle: bool = conn.query_row("WITH RECURSIVE subtree(id) AS (SELECT ?1 UNION SELECT t.id FROM tags t JOIN subtree s ON t.parent_id=s.id) SELECT EXISTS(SELECT 1 FROM subtree WHERE id=?2)",params![id,parent],|r|r.get(0))?;
+        if cycle { return Err(AppError::code("tagCycle")); }
+    }
+    let collision:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE parent_id IS ?2 AND name=(SELECT name FROM tags WHERE id=?1) COLLATE NOCASE AND id!=?1)",params![id,parent_id],|r|r.get(0))?;
+    if collision {return Err(AppError::code("tagNameExists"));}
+    conn.execute("UPDATE tags SET parent_id=?2 WHERE id=?1",params![id,parent_id])?;
+    Ok(())
+}
+
+fn tag_children(conn:&Connection,id:i64)->AppResult<Vec<(i64,String)>> {
+    let mut stmt=conn.prepare("SELECT id,name FROM tags WHERE parent_id=?1 ORDER BY id")?;
+    let rows=stmt.query_map([id],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<Vec<_>,_>>()?;
+    Ok(rows)
+}
+fn merge_tag_rows(conn:&Connection,source:i64,target:i64)->AppResult<()> {
+    for (child,name) in tag_children(conn,source)? {
+        let existing:Option<i64>=conn.query_row("SELECT id FROM tags WHERE parent_id=?1 AND name=?2 COLLATE NOCASE",params![target,name],|r|r.get(0)).optional()?;
+        if let Some(existing)=existing {merge_tag_rows(conn,child,existing)?;} else {conn.execute("UPDATE tags SET parent_id=?2 WHERE id=?1",params![child,target])?;}
+    }
+    conn.execute("INSERT INTO article_tags SELECT article_id,?2 FROM article_tags WHERE tag_id=?1 ON CONFLICT DO NOTHING",params![source,target])?;
+    conn.execute("DELETE FROM tags WHERE id=?1",[source])?;
+    Ok(())
+}
+pub(crate) fn delete_tag_rows(conn:&Connection,id:i64)->AppResult<()> {
+    for (child,name) in tag_children(conn,id)? {
+        let existing:Option<i64>=conn.query_row("SELECT id FROM tags WHERE parent_id IS NULL AND id!=?1 AND name=?2 COLLATE NOCASE",params![id,name],|r|r.get(0)).optional()?;
+        if let Some(existing)=existing {merge_tag_rows(conn,child,existing)?;} else {conn.execute("UPDATE tags SET parent_id=NULL WHERE id=?1",[child])?;}
+    }
+    conn.execute("DELETE FROM tags WHERE id=?1",[id])?;
+    Ok(())
+}
 pub fn delete_tag(conn: &Connection, id: i64) -> AppResult<()> {
-    conn.execute("DELETE FROM tags WHERE id = ?1", params![id])?;
+    let tx=conn.unchecked_transaction()?;
+    delete_tag_rows(&tx,id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -1808,7 +1932,7 @@ pub fn set_article_tag(conn: &Connection, article_id: i64, tag_id: i64, on: bool
 /// Tags attached to one article (article_count left at 0 — unused per-article).
 pub fn tags_for_article(conn: &Connection, article_id: i64) -> AppResult<Vec<Tag>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.color, t.position
+        "SELECT t.id, t.name, t.color, t.position, t.parent_id
          FROM tags t JOIN article_tags at ON at.tag_id = t.id
          WHERE at.article_id = ?1 ORDER BY t.position, t.name COLLATE NOCASE",
     )?;
@@ -1820,6 +1944,7 @@ pub fn tags_for_article(conn: &Connection, article_id: i64) -> AppResult<Vec<Tag
                 color: r.get(2)?,
                 position: r.get(3)?,
                 article_count: 0,
+                parent_id: r.get(4)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -2178,12 +2303,18 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
 pub fn configure_ai_provider(
     conn: &Connection, provider: &str, model: Option<&str>, base_url: Option<&str>,
 ) -> AppResult<(String, String)> {
-    if !matches!(provider, "anthropic" | "openai" | "deepseek") {
+    configure_ai_selection(conn, provider, model, base_url, None)
+}
+
+pub fn configure_ai_selection(
+    conn: &Connection, provider: &str, model: Option<&str>, base_url: Option<&str>, effort: Option<&str>,
+) -> AppResult<(String, String)> {
+    if !matches!(provider, "anthropic" | "openai" | "deepseek" | "codex") {
         return Err(AppError::other("invalid AI provider"));
     }
     let tx = conn.unchecked_transaction()?;
     let previous = get_setting(&tx, "ai_provider")?.unwrap_or_default();
-    let previous = match previous.as_str() { "openai" => "openai", "deepseek" => "deepseek", _ => "anthropic" };
+    let previous = match previous.as_str() { "codex" => "codex", "openai" => "openai", "deepseek" => "deepseek", _ => "anthropic" };
     for key in ["ai_model", "ai_base_url"] {
         let value = get_setting(&tx, key)?.unwrap_or_default();
         set_setting(&tx, &format!("{key}_{previous}"), &value)?;
@@ -2195,6 +2326,9 @@ pub fn configure_ai_provider(
         set_setting(&tx, &format!("{key}_{provider}"), value)?;
     }
     set_setting(&tx, "ai_provider", provider)?;
+    if let Some(effort) = effort {
+        set_setting(&tx, "ai_reasoning_effort_codex", effort)?;
+    }
     tx.commit()?;
     Ok((model, base_url))
 }
@@ -2523,29 +2657,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ai_sync_migration_seeds_existing_preferences_and_preserves_private_settings() {
+        let mut conn=Connection::open_in_memory().unwrap();
+        MIGRATIONS.to_version(&mut conn,25).unwrap();
+        for (key,value) in [("ai_provider","codex"),("ai_model","chosen"),("ai_reasoning_effort_codex","high"),("ai_summary_prompt","自定义摘要"),("ai_api_key","SECRET_KEY"),("ai_base_url","SECRET_URL")] {
+            set_setting(&conn,key,value).unwrap();
+        }
+        MIGRATIONS.to_latest(&mut conn).unwrap();
+        let records=webdav::records(&conn).unwrap();
+        let config=records.iter().find(|r|r.kind=="ai_config").unwrap();
+        assert_eq!(config.data,serde_json::json!({"provider":"codex","model":"chosen","effort":"high"}));
+        assert!(config.clock>0 && !config.nonce.is_empty());
+        let prompt=records.iter().find(|r|r.kind=="ai_prompt").unwrap();
+        assert_eq!(prompt.data["prompt"],"自定义摘要");
+        assert!(!serde_json::to_string(&records).unwrap().contains("SECRET"));
+        assert_eq!(get_setting(&conn,"ai_api_key").unwrap().as_deref(),Some("SECRET_KEY"));
+        assert_eq!(get_setting(&conn,"ai_base_url").unwrap().as_deref(),Some("SECRET_URL"));
+    }
+    #[test]
     fn startup_migrations_preserve_existing_databases() {
-        for version in [0, 19, 20, 21, 22] {
+        for version in [0, 19, 20, 21, 22, 23, 24, 25, 26, 27] {
             let path = std::env::temp_dir().join(format!("papr-migrations-{}-{}-{}.db",
                 std::process::id(), version,
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             let mut conn = Connection::open(&path).unwrap();
-            MIGRATIONS.to_version(&mut conn, version.min(21)).unwrap();
+            MIGRATIONS.to_version(&mut conn, version.min(26)).unwrap();
             if version > 0 {
                 conn.execute("INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.com/rss','Preserved')", []).unwrap();
                 conn.execute("INSERT INTO articles(feed_id,guid,title,is_starred) VALUES(1,'one','Article',1)", []).unwrap();
             }
             if version >= 20 { conn.execute("UPDATE feeds SET custom_favicon=1", []).unwrap(); }
             if version >= 21 { conn.execute("UPDATE feeds SET position=42", []).unwrap(); }
-            if version == 22 { conn.pragma_update(None, "user_version", 22).unwrap(); }
+            if version == 27 { conn.pragma_update(None, "user_version", 27).unwrap(); }
             drop(conn);
             let result = open(&path);
-            if version == 22 {
+            if version == 27 {
                 assert!(result.is_err());
                 let conn = Connection::open(&path).unwrap();
-                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 22);
+                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 27);
             } else {
                 let conn = result.unwrap();
-                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 21);
+                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 26);
                 if version > 0 {
                     let values: (String,i64,i64) = conn.query_row("SELECT title,custom_favicon,position FROM feeds WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
                     assert_eq!(values, ("Preserved".into(), i64::from(version>=20), if version>=21 {42} else {0}));
@@ -3056,6 +3208,79 @@ mod tests {
         // An all-stopword / punctuation-only question must not error and must
         // return nothing (the match-nothing `""` expression).
         assert!(search_articles_for_rag(&conn, "??? !!!", 6).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scoped_tag_migration_preserves_ids_membership_and_legacy_sync_payloads() {
+        let mut conn=Connection::open_in_memory().unwrap();
+        conn.pragma_update(None,"foreign_keys",true).unwrap();
+        MIGRATIONS.to_version(&mut conn,24).unwrap();
+        conn.execute("INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.com/rss','Feed')",[]).unwrap();
+        conn.execute("INSERT INTO articles(id,feed_id,guid,title) VALUES(1,1,'one','Article')",[]).unwrap();
+        conn.execute("INSERT INTO tags(id,name) VALUES(10,'agent')",[]).unwrap();
+        conn.execute("INSERT INTO tags(id,name,parent_id) VALUES(11,'code',10)",[]).unwrap();
+        conn.execute("INSERT INTO article_tags VALUES(1,11)",[]).unwrap();
+        let mut legacy=webdav::records(&conn).unwrap();
+        MIGRATIONS.to_latest(&mut conn).unwrap();
+        assert_eq!(tags_for_article(&conn,1).unwrap()[0].id,11);
+        assert_eq!(list_tags(&conn).unwrap().iter().find(|t|t.id==11).unwrap().parent_id,Some(10));
+        assert!(conn.query_row("PRAGMA foreign_key_check",[],|_|Ok(())).optional().unwrap().is_none());
+        let root_code=create_tag(&conn,"code").unwrap();assert_ne!(root_code,11);
+        webdav::upgrade_legacy_tags(&mut legacy).unwrap();
+        let (mut other,_)=test_db();webdav::merge(&mut other,&legacy).unwrap();
+        let tag=list_tags(&other).unwrap().into_iter().find(|t|t.name=="code").unwrap();
+        assert!(tag.parent_id.is_some());
+        let imported:i64=other.query_row("SELECT a.id FROM articles a JOIN feeds f ON f.id=a.feed_id WHERE f.feed_url='https://example.com/rss' AND a.guid='one'",[],|r|r.get(0)).unwrap();
+        assert_eq!(tags_for_article(&other,imported).unwrap()[0].id,tag.id);
+    }
+    #[test]
+    fn parent_tag_counts_distinct_articles_across_parent_siblings_and_descendants() {
+        let (conn,article)=test_db();
+        let feed:i64=conn.query_row("SELECT feed_id FROM articles WHERE id=?1",[article],|r|r.get(0)).unwrap();
+        add_article(&conn,feed,"second","Second","body");add_article(&conn,feed,"third","Third","body");
+        let second:i64=conn.query_row("SELECT id FROM articles WHERE guid='second'",[],|r|r.get(0)).unwrap();
+        let third:i64=conn.query_row("SELECT id FROM articles WHERE guid='third'",[],|r|r.get(0)).unwrap();
+        let leaves=create_tags_in(&conn,"agent/code;agent/docs;other/code",None).unwrap();
+        let agent=create_tag(&conn,"agent").unwrap();let other=create_tag(&conn,"other").unwrap();
+        for tag in [agent,leaves[0],leaves[1],leaves[2]] {set_article_tag(&conn,article,tag,true).unwrap();}
+        set_article_tag(&conn,second,leaves[0],true).unwrap();set_article_tag(&conn,third,leaves[1],true).unwrap();
+        let tags=list_tags(&conn).unwrap();let count=|id|tags.iter().find(|t|t.id==id).unwrap().article_count;
+        assert_eq!(count(agent),3);assert_eq!(count(leaves[0]),2);assert_eq!(count(leaves[1]),2);assert_eq!(count(other),1);
+        assert_eq!(list_articles(&conn,&ArticleQuery::Tag(agent),false,None,false,50,0).unwrap().len(),3);
+        set_article_tag(&conn,article,leaves[0],false).unwrap();
+        assert_eq!(list_tags(&conn).unwrap().iter().find(|t|t.id==agent).unwrap().article_count,3);
+    }
+
+    #[test]
+    fn tag_paths_create_nested_leaves_and_semicolons_create_multiple_tags() {
+        let (conn, _) = test_db();
+        let ids=create_tags_in(&conn," agent / code ; 阅读/待整理；agent/docs;agent/code; ",None).unwrap();
+        assert_eq!(ids.len(),3);
+        let tags=list_tags(&conn).unwrap();
+        assert_eq!(tags.len(),5);
+        for (leaf,parent) in [("code","agent"),("docs","agent"),("待整理","阅读")] {
+            let t=tags.iter().find(|t|t.name==leaf).unwrap();
+            let p=tags.iter().find(|t|t.name==parent).unwrap();
+            assert_eq!(t.parent_id,Some(p.id));assert!(ids.contains(&t.id));assert!(!ids.contains(&p.id));
+        }
+        let agent=tags.iter().find(|t|t.name=="agent").unwrap().id;
+        assert_eq!(create_tag(&conn,"agent/code").unwrap(),ids[0]);
+        let relative=create_tags_in(&conn,"tools/rust;notes",Some(agent)).unwrap();
+        let tags=list_tags(&conn).unwrap();
+        assert_eq!(tags.iter().find(|t|t.id==relative[1]).unwrap().parent_id,Some(agent));
+        assert_eq!(tags.iter().find(|t|t.name=="tools").unwrap().parent_id,Some(agent));
+    }
+    #[test]
+    fn tag_path_batch_rolls_back_on_invalid_path_and_reuses_shared_prefixes() {
+        let (conn, _) = test_db();
+        let root_code=create_tag(&conn,"code").unwrap();
+        let leaves=create_tags_in(&conn,"agent/code;agent/docs;other/code",None).unwrap();
+        assert_eq!(leaves.len(),3);assert_ne!(leaves[0],root_code);assert_ne!(leaves[0],leaves[2]);
+        let before=list_tags(&conn).unwrap().len();
+        for bad in ["new/path;agent//code", "/agent", "agent/", ";；", " "] {assert!(create_tags_in(&conn,bad,None).is_err(),"{bad}");}
+        assert_eq!(list_tags(&conn).unwrap().len(),before);
+        assert_eq!(create_tags_in(&conn,"agent/code",None).unwrap(),vec![leaves[0]]);
+        assert!(create_tag(&conn,"a;b").is_err());
     }
 
     #[test]

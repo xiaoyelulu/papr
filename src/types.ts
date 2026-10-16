@@ -42,6 +42,7 @@ export interface DiscoveryResult {
 
 export interface Folder {
   id: number;
+  parentId: number | null;
   name: string;
   position: number;
 }
@@ -78,6 +79,7 @@ export interface Enclosure {
 
 export interface Tag {
   id: number;
+  parentId: number | null;
   name: string;
   color: string;
   position: number;
@@ -148,6 +150,7 @@ export interface ArticleDetail {
   translatedHtml: string | null;
   /** The target language code the cached translation was produced for. */
   translatedLang: string | null;
+  readingProgress: number;
   enclosures: Enclosure[];
   tags: Tag[];
 }

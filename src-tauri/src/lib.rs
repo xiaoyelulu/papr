@@ -11,13 +11,22 @@ pub use papr_core::{ai, db, error, extraction, ingestion, models, opml, sanitize
 mod backing;
 mod commands;
 mod notify;
+#[cfg(desktop)]
+mod page_view;
+#[cfg(mobile)]
+#[path = "page_view_mobile.rs"]
 mod page_view;
 // The tauri-coupled refresh scheduler (progress channels, AppHandle) — built on
 // top of `papr_core::ingestion`. Was `ingestion::scheduler` before the split.
 mod scheduler;
 mod state;
 mod translate;
+#[cfg(desktop)]
 mod tray;
+#[cfg(mobile)]
+mod tray {
+    pub async fn refresh(_: &tauri::AppHandle) {}
+}
 
 use ingestion::discovery::{self, DeepLink};
 use state::AppState;
@@ -44,6 +53,7 @@ fn handle_deep_links(app: &tauri::AppHandle, urls: &[String]) {
         if let Some(DeepLink::Subscribe { url }) = discovery::parse_deep_link(raw) {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
+                #[cfg(desktop)]
                 let _ = window.unminimize();
                 let _ = window.set_focus();
             }
@@ -63,18 +73,15 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
-        .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ));
+        .plugin(tauri_plugin_deep_link::init());
 
     // Desktop-only in-app update: the updater plugin pulls signed bundles from
     // the GitHub release feed; the process plugin performs the relaunch.
     #[cfg(desktop)]
     {
         builder = builder
+            .plugin(tauri_plugin_window_state::Builder::default().build())
+            .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
             .plugin(tauri_plugin_updater::Builder::new().build())
             .plugin(tauri_plugin_process::init());
     }
@@ -113,11 +120,14 @@ pub fn run() {
             let http = ingestion::fetch::build_client_from_settings(&conn);
             // Snapshot the state the tray menu needs (read before the
             // connection moves behind the async mutex).
+            #[cfg(desktop)]
             let lang = db::get_setting(&conn, "language")
                 .ok()
                 .flatten()
                 .unwrap_or_default();
+            #[cfg(desktop)]
             let unread = db::count_unread(&conn).unwrap_or(0);
+            #[cfg(desktop)]
             let latest_fetch = db::latest_fetch(&conn).ok().flatten();
             // The persisted appearance (palette + mode), mirrored from the
             // frontend store. Used just below to paint the native window in the
@@ -185,6 +195,13 @@ pub fn run() {
                 // cold-start frame matches before the frontend re-asserts
                 // `set_native_backing`.
                 let (r, g, b) = match (pal, is_dark) {
+                    ("mint", false) => (0xEE, 0xF4, 0xE8),
+                    ("mint", true) => (0x18, 0x22, 0x1C),
+                    ("sepia", false) => (0xF4, 0xE8, 0xC9),
+                    ("sepia", true) => (0x26, 0x21, 0x19),
+                    ("gray", false) => (0xEC, 0xED, 0xED),
+                    ("gray", true) => (0x20, 0x23, 0x24),
+                    ("black", _) => (0x00, 0x00, 0x00),
                     ("frost", false) => (0xFF, 0xFF, 0xFF),
                     ("frost", true) => (0x1D, 0x1F, 0x23),
                     ("contrast", false) => (0xFF, 0xFF, 0xFF),
@@ -203,6 +220,7 @@ pub fn run() {
             }
 
             // ── Menu-bar tray (keeps the app resident for refreshes) ──
+            #[cfg(desktop)]
             tray::build(app.handle(), &lang, unread, latest_fetch.as_deref())?;
 
             // ── Background refresh scheduler ──────────────────────────
@@ -248,6 +266,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_folders,
             commands::create_folder,
+            commands::move_folder,
             commands::rename_folder,
             commands::delete_folder,
             commands::list_feeds,
@@ -277,9 +296,18 @@ pub fn run() {
             commands::get_setting,
             commands::set_setting,
             commands::configure_ai_provider,
+            commands::get_ai_preferences,
             commands::ai_test,
             commands::ai_summarize,
+            commands::get_summary_prompt,
+            commands::save_summary_prompt,
             commands::ai_ask,
+            commands::ai_article_chat,
+            commands::codex_status,
+            commands::codex_login,
+            commands::codex_cancel_login,
+            commands::codex_logout,
+            commands::codex_models,
             commands::ai_digest,
             commands::ai_translate,
             commands::translate_article_preview,
@@ -293,11 +321,20 @@ pub fn run() {
             commands::freshrss_disconnect,
             commands::freshrss_status,
             commands::freshrss_sync,
+            commands::webdav_status,
+            commands::webdav_conflicts,
+            commands::webdav_resolve,
+            commands::webdav_connect,
+            commands::webdav_disconnect,
+            commands::webdav_sync,
+            commands::set_reading_progress,
             commands::refresh_tray,
             commands::set_native_backing,
             commands::take_pending_deep_link,
             commands::list_tags,
             commands::create_tag,
+            commands::create_tags,
+            commands::move_tag,
             commands::rename_tag,
             commands::set_tag_color,
             commands::delete_tag,
@@ -319,6 +356,7 @@ pub fn run() {
             commands::set_highlight_color,
             commands::delete_highlight,
             page_view::open_page_view,
+            page_view::set_page_view_zoom,
             page_view::set_page_view_bounds,
             page_view::set_page_view_visible,
             page_view::close_page_view,

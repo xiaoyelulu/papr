@@ -1,0 +1,679 @@
+//! WebDAV transport for logical library snapshots (GET + conditional PUT).
+//! A strong ETag is required for existing files: unsupported concurrency
+//! protection fails closed instead of overwriting another device's upload.
+use crate::db::{
+    self,
+    webdav::{self as replication, Record},
+};
+use crate::error::{AppError, AppResult};
+use reqwest::{header, Client, StatusCode};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio::sync::Mutex;
+use url::Url;
+
+type Db = Mutex<Connection>;
+const FILE: &str = "papr-library-v1.json";
+const MAX_BYTES: usize = 128 * 1024 * 1024;
+// Serialize connect/disconnect/run in this process, including the scheduler.
+static SYNC_LOCK: Mutex<()> = Mutex::const_new(());
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct Snapshot {
+    version: u32,
+    records: Vec<Record>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Status {
+    pub connected: bool,
+    pub url: Option<String>,
+    pub username: Option<String>,
+    pub last_sync: Option<String>,
+    pub last_error: Option<&'static str>,
+    pub conflicts: usize,
+}
+
+struct Credentials {
+    url: Url,
+    user: String,
+    password: String,
+}
+
+fn base_url(input: &str) -> AppResult<Url> {
+    let mut url = Url::parse(input.trim()).map_err(|_| AppError::code("webdavInvalidUrl"))?;
+    if !matches!(url.scheme(), "https" | "http")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(AppError::code("webdavInvalidUrl"));
+    }
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+    Ok(url)
+}
+
+fn credentials(conn: &Connection) -> AppResult<Option<Credentials>> {
+    let Some(url) = db::get_setting(conn, "webdav_url")?.filter(|u| !u.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(Credentials {
+        url: base_url(&url)?,
+        user: db::get_setting(conn, "webdav_user")?.unwrap_or_default(),
+        password: db::get_setting(conn, "webdav_password")?.unwrap_or_default(),
+    }))
+}
+
+pub async fn status(db: &Db) -> AppResult<Status> {
+    let conn = db.lock().await;
+    let c = credentials(&conn)?;
+    Ok(Status {
+        connected: c.is_some(),
+        url: c.as_ref().map(|c| c.url.to_string()),
+        username: c.map(|c| c.user),
+        last_sync: db::get_setting(&conn, "webdav_last_sync")?,
+        conflicts: replication::conflicts(&conn)?.len(),
+        last_error: db::get_setting(&conn, "webdav_last_error")?
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                if s == "webdavNeedsResolution" {
+                    "webdavNeedsResolution"
+                } else {
+                    "webdavSyncFailed"
+                }
+            }),
+    })
+}
+
+fn request(
+    http: &Client,
+    c: &Credentials,
+    method: reqwest::Method,
+    url: Url,
+) -> reqwest::RequestBuilder {
+    http.request(method, url)
+        .basic_auth(&c.user, Some(&c.password))
+        .timeout(Duration::from_secs(120))
+}
+
+fn http_error(status: StatusCode) -> AppError {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => AppError::code("webdavAuthFailed"),
+        _ => AppError::other(format!("WebDAV: HTTP {status}")),
+    }
+}
+
+// Strip the request URL from transport errors: some deployments put private
+// tokens in their WebDAV path. Server response bodies are never logged.
+fn network_error(e: reqwest::Error) -> AppError {
+    AppError::Http(e.without_url())
+}
+
+/// Create only the final directory; the configured parent must already exist.
+async fn ensure_collection(http: &Client, c: &Credentials) -> AppResult<()> {
+    let resp = request(
+        http,
+        c,
+        reqwest::Method::from_bytes(b"MKCOL").unwrap(),
+        c.url.clone(),
+    )
+    .send()
+    .await
+    .map_err(network_error)?;
+    if resp.status().is_success() || resp.status() == StatusCode::METHOD_NOT_ALLOWED {
+        Ok(())
+    } else {
+        Err(http_error(resp.status()))
+    }
+}
+
+async fn download(http: &Client, c: &Credentials) -> AppResult<(Snapshot, Option<String>)> {
+    let mut resp = request(http, c, reqwest::Method::GET, c.url.join(FILE)?)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .send()
+        .await
+        .map_err(network_error)?;
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Ok((
+            Snapshot {
+                version: 5,
+                records: Vec::new(),
+            },
+            None,
+        ));
+    }
+    if !resp.status().is_success() {
+        return Err(http_error(resp.status()));
+    }
+    let etag = resp
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.starts_with('"') && v.ends_with('"'))
+        .ok_or_else(|| AppError::code("webdavEtagRequired"))?
+        .to_string();
+    if resp.content_length().is_some_and(|n| n > MAX_BYTES as u64) {
+        return Err(AppError::code("webdavTooLarge"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(network_error)? {
+        if body.len() + chunk.len() > MAX_BYTES {
+            return Err(AppError::code("webdavTooLarge"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let mut snapshot: Snapshot =
+        serde_json::from_slice(&body).map_err(|_| AppError::code("webdavInvalidData"))?;
+    if !matches!(snapshot.version, 1 | 2 | 3 | 4 | 5) {
+        return Err(AppError::code("webdavVersion"));
+    }
+    if snapshot.version < 4 {
+        replication::upgrade_legacy_tags(&mut snapshot.records)?;
+    }
+    Ok((snapshot, Some(etag)))
+}
+
+/// Verify read and write access using a disposable file. Never upload or merge
+/// library data merely because the user saves connection settings.
+pub async fn connect(
+    db: &Db,
+    http: &Client,
+    url: &str,
+    user: &str,
+    password: &str,
+) -> AppResult<()> {
+    let _guard = SYNC_LOCK.lock().await;
+    {
+        let conn = db.lock().await;
+        if db::is_freshrss_connected(&conn) {
+            return Err(AppError::code("syncProviderConflict"));
+        }
+    }
+    let c = Credentials {
+        url: base_url(url)?,
+        user: user.trim().into(),
+        password: password.into(),
+    };
+    ensure_collection(http, &c).await?;
+    download(http, &c).await?;
+    let nonce: String = {
+        let conn = db.lock().await;
+        replication::probe_id(&conn)?
+    };
+    let probe = c.url.join(&format!(".papr-test-{nonce}"))?;
+    let resp = request(http, &c, reqwest::Method::PUT, probe.clone())
+        .header(header::IF_NONE_MATCH, "*")
+        .body("papr")
+        .send()
+        .await
+        .map_err(network_error)?;
+    if !resp.status().is_success() {
+        return Err(http_error(resp.status()));
+    }
+    let resp = request(http, &c, reqwest::Method::DELETE, probe)
+        .send()
+        .await
+        .map_err(network_error)?;
+    if !resp.status().is_success() {
+        return Err(http_error(resp.status()));
+    }
+    let mut conn = db.lock().await;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if db::is_freshrss_connected(&tx) {
+        return Err(AppError::code("syncProviderConflict"));
+    }
+    if db::get_setting(&tx, "webdav_url")?.as_deref() != Some(c.url.as_str())
+        || db::get_setting(&tx, "webdav_user")?.as_deref() != Some(c.user.as_str())
+    {
+        tx.execute("DELETE FROM webdav_baseline", [])?;
+        tx.execute("DELETE FROM webdav_conflicts", [])?;
+        tx.execute("DELETE FROM webdav_observed", [])?;
+    }
+    for (key, value) in [
+        ("webdav_url", c.url.as_str()),
+        ("webdav_user", c.user.as_str()),
+        ("webdav_password", password),
+        ("webdav_last_sync", ""),
+        ("webdav_last_error", ""),
+    ] {
+        db::set_setting(&tx, key, value)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub async fn disconnect(db: &Db) -> AppResult<()> {
+    let _guard = SYNC_LOCK.lock().await;
+    let mut conn = db.lock().await;
+    let tx = conn.transaction()?;
+    for key in [
+        "webdav_url",
+        "webdav_user",
+        "webdav_password",
+        "webdav_last_sync",
+        "webdav_last_error",
+    ] {
+        db::set_setting(&tx, key, "")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub async fn conflicts(db: &Db) -> AppResult<Vec<replication::Conflict>> {
+    replication::conflicts(&*db.lock().await)
+}
+pub async fn resolve(db: &Db, kind: &str, key: &str, choice: &str) -> AppResult<()> {
+    let _guard = SYNC_LOCK.lock().await;
+    replication::resolve_conflict(&mut *db.lock().await, kind, key, choice)
+}
+
+pub async fn run_if_connected(db: &Db, http: &Client) -> AppResult<bool> {
+    if !status(db).await?.connected {
+        return Ok(false);
+    }
+    sync_now(db, http).await.map(|_| true)
+}
+
+pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
+    let _guard = SYNC_LOCK.lock().await;
+    let c = {
+        let conn = db.lock().await;
+        credentials(&conn)?.ok_or_else(|| AppError::code("webdavNotConnected"))?
+    };
+    let result = sync_inner(db, http, &c).await;
+    let conn = db.lock().await;
+    match &result {
+        Ok(_) => {
+            db::set_setting(&conn, "webdav_last_sync", &chrono::Utc::now().to_rfc3339())?;
+            db::set_setting(&conn, "webdav_last_error", "")?;
+        }
+        Err(error) => {
+            db::set_setting(
+                &conn,
+                "webdav_last_error",
+                if matches!(error, AppError::Coded("webdavNeedsResolution")) {
+                    "webdavNeedsResolution"
+                } else {
+                    "webdavSyncFailed"
+                },
+            )?;
+        }
+    }
+    result
+}
+
+async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize> {
+    let mut total = 0;
+    for _ in 0..3 {
+        let (remote, etag) = download(http, c).await?;
+        let snapshot = {
+            let mut conn = db.lock().await;
+            total += replication::merge_remote(&mut conn, &remote.records)?;
+            Snapshot {
+                version: 5,
+                records: replication::records(&conn)?,
+            }
+        };
+        if snapshot.records == remote.records {
+            replication::acknowledge(&*db.lock().await, &snapshot.records)?;
+            return Ok(total);
+        }
+        let body =
+            serde_json::to_vec(&snapshot).map_err(|_| AppError::code("webdavInvalidData"))?;
+        if body.len() > MAX_BYTES {
+            return Err(AppError::code("webdavTooLarge"));
+        }
+        let mut req = request(http, c, reqwest::Method::PUT, c.url.join(FILE)?)
+            .header(header::CONTENT_TYPE, "application/json");
+        req = if let Some(etag) = etag {
+            req.header(header::IF_MATCH, etag)
+        } else {
+            req.header(header::IF_NONE_MATCH, "*")
+        };
+        let resp = req.body(body).send().await.map_err(network_error)?;
+        if matches!(
+            resp.status(),
+            StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT
+        ) {
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(http_error(resp.status()));
+        }
+        replication::acknowledge(&*db.lock().await, &snapshot.records)?;
+        return Ok(total);
+    }
+    Err(AppError::code("webdavConflict"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Default)]
+    struct Server {
+        body: Option<Vec<u8>>,
+        revision: u64,
+        conflict: bool,
+        missing_etag: bool,
+        deny: bool,
+        fail_upload: bool,
+        conditional_writes: usize,
+    }
+    async fn server() -> (String, Arc<StdMutex<Server>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/papr/", listener.local_addr().unwrap());
+        let state = Arc::new(StdMutex::new(Server::default()));
+        let shared = state.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break None;
+                    }
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(p) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        break Some(p + 4);
+                    }
+                };
+                let Some(end) = end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_string();
+                let length = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < end + length {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let (code, etag, body) = {
+                    let mut s = shared.lock().unwrap();
+                    let method = headers.split_whitespace().next().unwrap();
+                    let probe = headers.lines().next().unwrap().contains(".papr-test-");
+                    if s.deny {
+                        (401, None, Vec::new())
+                    } else if method == "MKCOL" {
+                        (405, None, Vec::new())
+                    } else if probe {
+                        (if method == "PUT" { 201 } else { 204 }, None, Vec::new())
+                    } else if method == "GET" {
+                        match s.body.clone() {
+                            Some(body) => (
+                                200,
+                                if s.missing_etag {
+                                    None
+                                } else {
+                                    Some(format!("\"{}\"", s.revision))
+                                },
+                                body,
+                            ),
+                            None => (404, None, Vec::new()),
+                        }
+                    } else if method == "PUT" {
+                        let lower = headers.to_ascii_lowercase();
+                        s.conditional_writes += 1;
+                        let expected = if s.body.is_some() {
+                            format!("if-match: \"{}\"", s.revision)
+                        } else {
+                            "if-none-match: *".into()
+                        };
+                        assert!(lower.contains(&expected), "Missing condition: {headers}");
+                        if s.fail_upload {
+                            (500, None, Vec::new())
+                        } else if s.conflict {
+                            s.conflict = false;
+                            s.revision += 1;
+                            (412, None, Vec::new())
+                        } else {
+                            s.body = Some(bytes[end..end + length].to_vec());
+                            s.revision += 1;
+                            (201, None, Vec::new())
+                        }
+                    } else {
+                        (400, None, Vec::new())
+                    }
+                };
+                let etag = etag.map(|s| format!("ETag: {s}\r\n")).unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 {code} Test\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+        });
+        (url, state, task)
+    }
+    fn database() -> Db {
+        Mutex::new(db::open(std::path::Path::new(":memory:")).unwrap())
+    }
+    fn client() -> Client {
+        Client::builder().no_proxy().build().unwrap()
+    }
+    async fn seed(db: &Db) {
+        let conn = db.lock().await;
+        conn.execute(
+            "INSERT INTO feeds(feed_url,title) VALUES('https://example.com/rss','Feed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO articles(feed_id,guid,title) VALUES(1,'one','Article')",
+            [],
+        )
+        .unwrap();
+        db::set_read(&conn, 1, true).unwrap();
+    }
+    #[tokio::test]
+    async fn two_devices_merge_over_http_and_retry_conditional_conflicts() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        let b = database();
+        seed(&a).await;
+        connect(&a, &http, &url, "alice", "SECRET").await.unwrap();
+        assert!(
+            server.lock().unwrap().body.is_none(),
+            "Connecting must not upload the library"
+        );
+        sync_now(&a, &http).await.unwrap();
+        connect(&b, &http, &url, "alice", "SECRET").await.unwrap();
+        server.lock().unwrap().conflict = true;
+        sync_now(&b, &http).await.unwrap();
+        {
+            let conn = b.lock().await;
+            assert!(db::get_article(&conn, 1).unwrap().is_read);
+            db::set_starred(&conn, 1, true).unwrap();
+        }
+        sync_now(&b, &http).await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        assert!(db::get_article(&*a.lock().await, 1).unwrap().is_starred);
+        assert!(status(&a).await.unwrap().last_sync.is_some());
+        assert!(
+            !String::from_utf8(server.lock().unwrap().body.clone().unwrap())
+                .unwrap()
+                .contains("SECRET")
+        );
+        assert_eq!(server.lock().unwrap().conditional_writes, 3);
+        sync_now(&a, &http).await.unwrap();
+        assert_eq!(
+            server.lock().unwrap().conditional_writes,
+            3,
+            "Idle sync must not upload again"
+        );
+        disconnect(&a).await.unwrap();
+        assert!(!status(&a).await.unwrap().connected);
+        assert!(server.lock().unwrap().body.is_some());
+        task.abort();
+    }
+    #[tokio::test]
+    async fn ai_preferences_sync_over_http_with_conflict_review_and_no_secrets() {
+        let (url, server, task) = server().await;
+        let http=client(); let a=database(); let b=database();
+        {
+            let c=a.lock().await;
+            db::configure_ai_selection(&c,"codex",Some("shared-model"),None,Some("high")).unwrap();
+            db::set_setting(&c,"ai_summary_prompt","Shared prompt").unwrap();
+            db::set_setting(&c,"ai_api_key","SECRET_AI_KEY").unwrap();
+            db::set_setting(&c,"ai_base_url","https://SECRET@example.com/v1").unwrap();
+        }
+        connect(&a,&http,&url,"a","SECRET_DAV").await.unwrap();
+        sync_now(&a,&http).await.unwrap();
+        connect(&b,&http,&url,"a","SECRET_DAV").await.unwrap();
+        sync_now(&b,&http).await.unwrap();
+        {
+            let c=b.lock().await;
+            assert_eq!(db::get_setting(&c,"ai_provider").unwrap().as_deref(),Some("codex"));
+            assert_eq!(db::get_setting(&c,"ai_model").unwrap().as_deref(),Some("shared-model"));
+            assert_eq!(db::get_setting(&c,"ai_reasoning_effort_codex").unwrap().as_deref(),Some("high"));
+            assert_eq!(db::get_setting(&c,"ai_summary_prompt").unwrap().as_deref(),Some("Shared prompt"));
+            assert!(db::get_setting(&c,"ai_api_key").unwrap().is_none());
+            db::set_setting(&c,"ai_summary_prompt","Device B prompt").unwrap();
+        }
+        db::set_setting(&*a.lock().await,"ai_summary_prompt","Device A prompt").unwrap();
+        sync_now(&a,&http).await.unwrap();
+        let before=server.lock().unwrap().body.clone();
+        assert!(matches!(sync_now(&b,&http).await,Err(AppError::Coded("webdavNeedsResolution"))));
+        assert_eq!(server.lock().unwrap().body,before);
+        let c=conflicts(&b).await.unwrap().remove(0); assert_eq!(c.kind,"ai_prompt");
+        resolve(&b,"ai_prompt","summary","local").await.unwrap();
+        sync_now(&b,&http).await.unwrap(); sync_now(&a,&http).await.unwrap();
+        assert_eq!(db::get_setting(&*a.lock().await,"ai_summary_prompt").unwrap().as_deref(),Some("Device B prompt"));
+        let body=String::from_utf8(server.lock().unwrap().body.clone().unwrap()).unwrap();
+        assert!(!body.contains("SECRET"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["version"],5);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn conflicting_progress_pauses_before_upload_and_resolution_converges() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        let b = database();
+        seed(&a).await;
+        connect(&a, &http, &url, "a", "p").await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        connect(&b, &http, &url, "a", "p").await.unwrap();
+        sync_now(&b, &http).await.unwrap();
+        replication::set_progress(&*a.lock().await, 1, 0.2).unwrap();
+        sync_now(&a, &http).await.unwrap();
+        replication::set_progress(&*b.lock().await, 1, 0.8).unwrap();
+        let before = server.lock().unwrap().body.clone();
+        let writes = server.lock().unwrap().conditional_writes;
+        assert!(matches!(
+            sync_now(&b, &http).await,
+            Err(AppError::Coded("webdavNeedsResolution"))
+        ));
+        assert_eq!(status(&b).await.unwrap().conflicts, 1);
+        assert_eq!(server.lock().unwrap().body, before);
+        assert_eq!(server.lock().unwrap().conditional_writes, writes);
+        let conflict = conflicts(&b).await.unwrap().remove(0);
+        resolve(&b, &conflict.kind, &conflict.key, "local")
+            .await
+            .unwrap();
+        sync_now(&b, &http).await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        assert_eq!(status(&b).await.unwrap().conflicts, 0);
+        assert_eq!(
+            db::get_article(&*a.lock().await, 1)
+                .unwrap()
+                .reading_progress,
+            0.8
+        );
+        assert_eq!(
+            replication::records(&*a.lock().await).unwrap(),
+            replication::records(&*b.lock().await).unwrap()
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn refuses_unsafe_or_malformed_remote_and_keeps_local_library() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        seed(&a).await;
+        connect(&a, &http, &url, "alice", "secret").await.unwrap();
+        {
+            let mut s = server.lock().unwrap();
+            s.body = Some(b"not json".to_vec());
+            s.missing_etag = true;
+        }
+        assert!(matches!(
+            sync_now(&a, &http).await,
+            Err(AppError::Coded("webdavEtagRequired"))
+        ));
+        server.lock().unwrap().missing_etag = false;
+        assert!(matches!(
+            sync_now(&a, &http).await,
+            Err(AppError::Coded("webdavInvalidData"))
+        ));
+        server.lock().unwrap().body = Some(br#"{"version":999,"records":[]}"#.to_vec());
+        assert!(matches!(
+            sync_now(&a, &http).await,
+            Err(AppError::Coded("webdavVersion"))
+        ));
+        assert!(db::get_article(&*a.lock().await, 1).unwrap().is_read);
+        assert!(status(&a).await.unwrap().last_error.is_some());
+        task.abort();
+    }
+    #[tokio::test]
+    async fn failed_auth_does_not_save_credentials_and_failed_upload_can_retry() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        seed(&a).await;
+        server.lock().unwrap().deny = true;
+        assert!(matches!(
+            connect(&a, &http, &url, "a", "p").await,
+            Err(AppError::Coded("webdavAuthFailed"))
+        ));
+        assert!(!status(&a).await.unwrap().connected);
+        server.lock().unwrap().deny = false;
+        connect(&a, &http, &url, "a", "p").await.unwrap();
+        server.lock().unwrap().fail_upload = true;
+        assert!(sync_now(&a, &http).await.is_err());
+        server.lock().unwrap().fail_upload = false;
+        sync_now(&a, &http).await.unwrap();
+        assert!(status(&a).await.unwrap().last_error.is_none());
+        task.abort();
+    }
+    #[test]
+    fn validates_directory_urls() {
+        assert_eq!(
+            base_url(" https://example.com/dav/papr ").unwrap().as_str(),
+            "https://example.com/dav/papr/"
+        );
+        for url in [
+            "file:///tmp/test",
+            "https://user:password@example.com/dav",
+            "https://example.com/dav?token=secret",
+            "https://example.com/#fragment",
+        ] {
+            assert!(base_url(url).is_err());
+        }
+    }
+}
