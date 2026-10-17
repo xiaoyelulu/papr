@@ -439,3 +439,8 @@ export const webdavSaveNetwork = (options: WebDavNetworkOptions) => invoke<void>
 export const webdavProgress = () => invoke<WebDavProgress>("webdav_progress");
 export const webdavCancel = () => invoke<void>("webdav_cancel");
 export const webdavRelocate = (directory: string) => invoke<string>("webdav_relocate", { directory });
+
+export interface WebDavSchedule { intervalMinutes: number }
+export const webdavSchedule = () => invoke<WebDavSchedule>("webdav_schedule");
+export const webdavSaveSchedule = (options: WebDavSchedule) => invoke<void>("webdav_save_schedule", { options });
+export const webdavAutoSync = () => invoke<boolean>("webdav_auto_sync");

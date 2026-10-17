@@ -15,6 +15,7 @@ import Icon, { type IconName } from "./Icon";
 import ContextMenu, { type MenuEntry } from "./ContextMenu";
 import FeedAvatar from "./FeedAvatar";
 import PromptDialog from "./PromptDialog";
+import WebDavSyncButton from "./WebDavSyncButton";
 
 interface Props {
   onAddFeed: () => void;
@@ -903,6 +904,7 @@ export default function Sidebar({
         >
           <Icon name="globe" size={14} />
         </button>
+        <WebDavSyncButton className="sb-sync" onOpenSettings={() => onOpenSettings("sync")} onToast={onToast} />
         <div className="spacer" />
         <button
           title={t("sidebar.settings")}

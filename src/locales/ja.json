@@ -627,11 +627,19 @@
         "relocating": "新しいフォルダにコピー中",
         "publishing": "リモート一覧を保存中",
         "done": "同期完了",
-        "failed": "転送に失敗しました。再試行できます",
+        "failed": "同期未完了：下のエラーを確認してください",
         "cancelled": "停止しました。再開できます",
-        "relocated": "フォルダを切り替えました"
+        "relocated": "フォルダを切り替えました",
+        "needsResolution": "データの競合を確認してください"
       },
-      "scopeHelp": "同期内容と更新の説明"
+      "scopeHelp": "同期内容と更新の説明",
+      "autoInterval": "自動同期の間隔",
+      "manualOnly": "手動のみ",
+      "everyMinutes": "{{count}} 分ごと",
+      "scheduleHint": "既定は1時間です。失敗・中止後も指定した間隔を待ちます。「手動のみ」ではタイマー、前面への復帰、通信復旧による同期を停止します。macOSはアプリの起動中、iOSのバックグラウンド動作は制限されるため、前面で同期を完了してください。この設定は端末ごとに保存します。",
+      "saveSchedule": "同期間隔を保存",
+      "scheduleSaved": "同期間隔を保存しました",
+      "everyHours": "{{count}} 時間ごと"
     },
     "codex": {
       "login": "ChatGPT でログイン",
@@ -727,7 +735,10 @@
     "moveTagToRoot": "タグを最上位へ移動",
     "expandTag": "タグを展開",
     "collapseTag": "タグを折りたたむ",
-    "tagCountHint": "このタグとすべての子タグの記事を含み、同じ記事は一度だけ数えます。"
+    "tagCountHint": "このタグとすべての子タグの記事を含み、同じ記事は一度だけ数えます。",
+    "sync": "同期",
+    "syncing": "同期中",
+    "webdavSync": "WebDAVを今すぐ同期"
   },
   "error": {
     "db": "データベースエラー：{{detail}}",
@@ -775,7 +786,7 @@
     "webdavInvalidData": "WebDAV ライブラリの形式が無効です。ローカルデータは置き換えていません。",
     "webdavVersion": "未対応の WebDAV 同期形式です。Papr を更新してください。",
     "webdavNotConnected": "先に WebDAV サーバーに接続してください。",
-    "webdavConflict": "同期中に別の端末がライブラリを変更しました。再試行してください。",
+    "webdavConflict": "同期中にリモートの一覧が変更され続けました。上書きせずに停止しました。後で再試行してください。",
     "webdavSyncFailed": "前回の WebDAV 同期に失敗しました。「今すぐ同期」で再試行してエラーを確認してください。",
     "syncProviderConflict": "別の同期サービスに接続する前に、現在の接続を解除してください。",
     "folderCycle": "フォルダを自身または配下のフォルダに移動することはできません。",
@@ -798,7 +809,11 @@
     "webdavDirectoryOccupied": "別の Papr ライブラリが存在します。新しい名前を選んでください。",
     "webdavCopyUnsupported": "旧形式をコピーできません。通常の同期を完了してから再試行してください。",
     "webdavCancelled": "停止しました。完了したチャンクは次回再利用できます。",
-    "webdavRateLimited": "サーバーの制限中です。後で再試行するか、並列数を減らしてください。"
+    "webdavRateLimited": "サーバーの制限中です。後で再試行するか、並列数を減らしてください。",
+    "webdavPreconditionFailed": "サーバーが一覧のバージョン検証を拒否しました（HTTP 412）。再取得した一覧に変更はありません。他の端末のアップロードを示すものではありません。続く場合はWebDAVやプロキシのETag対応を確認してください。",
+    "webdavRemoteConflict": "サーバーが一覧の公開を拒否しました（HTTP 409）。同期先の存在、書き込み権限、ロックを確認してください。既存のリモート一覧は保持しています。",
+    "webdavBusy": "この端末で同期または接続処理を実行中です。完了をお待ちください。",
+    "webdavInvalidSchedule": "0〜1440分の同期間隔を指定してください。"
   },
   "highlights": {
     "toolbarLabel": "ハイライトの色",

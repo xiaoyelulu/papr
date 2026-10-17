@@ -627,11 +627,19 @@
         "relocating": "转存到新文件夹",
         "publishing": "保存远端清单",
         "done": "同步完成",
-        "failed": "本次传输失败，可重试",
+        "failed": "本次同步未完成，请查看下方错误",
         "cancelled": "已停止，可继续同步",
-        "relocated": "目录切换完成，可继续同步"
+        "relocated": "目录切换完成，可继续同步",
+        "needsResolution": "有数据冲突，等待你选择保留版本"
       },
-      "scopeHelp": "同步内容与升级说明"
+      "scopeHelp": "同步内容与升级说明",
+      "autoInterval": "自动同步频率",
+      "manualOnly": "仅手动同步",
+      "everyMinutes": "每 {{count}} 分钟",
+      "scheduleHint": "默认每 1 小时同步，失败或取消后也会等待所选间隔。仅手动模式下，定时器、回到前台和网络恢复均不会触发同步。macOS 需保持应用运行；iOS 后台运行受系统限制，请在前台完成同步。此设置仅保存在当前设备。",
+      "saveSchedule": "保存同步频率",
+      "scheduleSaved": "同步频率已保存，立即生效",
+      "everyHours": "每 {{count}} 小时"
     },
     "codex": {
       "login": "使用 ChatGPT 登录",
@@ -727,7 +735,10 @@
     "moveTagToRoot": "移至顶级标签",
     "expandTag": "展开标签",
     "collapseTag": "折叠标签",
-    "tagCountHint": "包含本标签与所有子标签的文章，同一篇只计一次。"
+    "tagCountHint": "包含本标签与所有子标签的文章，同一篇只计一次。",
+    "sync": "同步",
+    "syncing": "同步中",
+    "webdavSync": "立即进行 WebDAV 同步"
   },
   "error": {
     "db": "数据库出错：{{detail}}",
@@ -775,7 +786,7 @@
     "webdavInvalidData": "WebDAV 文章库文件格式无效，本机数据未被替换。",
     "webdavVersion": "此 WebDAV 文章库使用了不支持的协议版本，请升级 Papr。",
     "webdavNotConnected": "请先连接 WebDAV 服务。",
-    "webdavConflict": "同步期间另一台设备修改了文章库，请重试。",
+    "webdavConflict": "远端清单在同步期间持续变化，本次未覆盖远端数据，请稍后重试。",
     "webdavSyncFailed": "上次 WebDAV 同步失败，点击“立即同步”重试并查看错误。",
     "syncProviderConflict": "请先断开当前同步服务，再连接其他服务。",
     "folderCycle": "文件夹不能移入自身或它的子目录。",
@@ -798,7 +809,11 @@
     "webdavDirectoryOccupied": "目标文件夹已有不同的 Papr 同步库，请换一个新名称。",
     "webdavCopyUnsupported": "服务器不支持复制旧格式同步库。请先完成一次普通同步，再切换目录。",
     "webdavCancelled": "已停止本次传输。已完成的分块会在下次同步时复用。",
-    "webdavRateLimited": "网盘暂时限流，请稍后重试，或降低并发数。"
+    "webdavRateLimited": "网盘暂时限流，请稍后重试，或降低并发数。",
+    "webdavPreconditionFailed": "服务器拒绝了同步清单的版本校验（HTTP 412），重新读取后清单未变化；这不代表有其他设备正在上传。请重试；若持续出现，请检查 WebDAV 服务或代理的 ETag 支持。",
+    "webdavRemoteConflict": "服务器拒绝发布同步清单（HTTP 409）。请检查同步目录是否存在、可写，或被服务端锁定；原有远端清单已保留。",
+    "webdavBusy": "当前设备已有同步或连接操作正在进行，请等待完成。",
+    "webdavInvalidSchedule": "请选择 0–1440 分钟的同步频率。"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",

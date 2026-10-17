@@ -1433,6 +1433,21 @@ pub async fn webdav_network_options(state:State<'_,AppState>)->AppResult<papr_co
 #[tauri::command]
 pub async fn webdav_save_network(state:State<'_,AppState>,options:papr_core::webdav::NetworkOptions)->AppResult<()> {options.save(&*state.db.lock().await)}
 #[tauri::command]
+pub async fn webdav_schedule(state:State<'_,AppState>)->AppResult<papr_core::webdav::ScheduleOptions> {papr_core::webdav::ScheduleOptions::read(&*state.read().await)}
+#[tauri::command]
+pub async fn webdav_save_schedule(state:State<'_,AppState>,options:papr_core::webdav::ScheduleOptions)->AppResult<()> {options.save(&*state.db.lock().await)}
+#[tauri::command]
+pub async fn webdav_auto_sync(app:AppHandle)->AppResult<bool> {
+    let state = app.state::<AppState>();
+    let result = papr_core::webdav::run_if_connected(&state.db,&state.http()).await;
+    if !matches!(result,Ok(false)) {
+        let _ = app.emit("feeds-updated",0);
+        let _ = app.emit("webdav-updated",());
+        refresh_unread_surfaces(&app).await;
+    }
+    result
+}
+#[tauri::command]
 pub async fn webdav_relocate(state:State<'_,AppState>,directory:String)->AppResult<String> {
     let client=papr_core::webdav::http_client(&*state.db.lock().await)?;
     papr_core::webdav::relocate(&state.db,&client,&directory).await
@@ -1447,7 +1462,7 @@ pub async fn webdav_disconnect(state: State<'_, AppState>) -> AppResult<()> {
 pub async fn webdav_sync(app: AppHandle) -> AppResult<usize> {
     let state = app.state::<AppState>();
     let client=papr_core::webdav::http_client(&*state.db.lock().await)?;
-    let result = papr_core::webdav::sync_now(&state.db, &client).await;
+    let result = papr_core::webdav::try_sync_now(&state.db, &client).await;
     // A failed upload may still have imported remote edits.
     let _ = app.emit("feeds-updated", 0);
     let _ = app.emit("webdav-updated", ());

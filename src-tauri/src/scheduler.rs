@@ -58,18 +58,6 @@ pub async fn refresh_all(
     })
     .await?;
 
-    // Reading state must sync even when no subscription is due for refresh.
-    match papr_core::webdav::run_if_connected(&state.db, &client).await {
-        Ok(false) => {},
-        result => {
-            let _ = app.emit("feeds-updated", 0);
-            let _ = app.emit("webdav-updated", ());
-            notify::update_badge(app).await;
-            tray::refresh(app).await;
-            if let Err(e) = result { log::warn!("WebDAV sync failed: {e}"); }
-        }
-    }
-
     // Background scheduler with nothing due this cycle: bow out before the
     // heavier tail (sync, notifications, tray) so an idle tick is genuinely idle.
     if !summary.ran {
@@ -105,6 +93,25 @@ const SCHEDULER_TICK: Duration = Duration::from_secs(60);
 /// Spawn the background refresh loop. The app must stay resident (tray) for this
 /// to run — macOS does not execute the process after the app is quit.
 pub fn spawn_scheduler(app: AppHandle) {
+    let sync_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        loop {
+            let state = sync_app.state::<AppState>();
+            let client = state.http();
+            match papr_core::webdav::run_if_connected(&state.db, &client).await {
+                Ok(false) => {},
+                result => {
+                    let _ = sync_app.emit("feeds-updated", 0);
+                    let _ = sync_app.emit("webdav-updated", ());
+                    notify::update_badge(&sync_app).await;
+                    tray::refresh(&sync_app).await;
+                    if let Err(e) = result { log::warn!("WebDAV sync failed: {e}"); }
+                }
+            }
+            tokio::time::sleep(SCHEDULER_TICK).await;
+        }
+    });
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(8)).await;
         loop {

@@ -17,6 +17,8 @@ mod chunks;
 mod directory;
 pub use directory::{directory_url, relocate};
 mod network;
+mod schedule;
+pub use schedule::Options as ScheduleOptions;
 mod progress;
 mod transport;
 pub(crate) use chunks::schema as chunk_schema;
@@ -109,6 +111,12 @@ pub async fn status(db: &Db) -> AppResult<Status> {
                     "webdavNeedsResolution"
                 } else if s == "webdavRateLimited" {
                     "webdavRateLimited"
+                } else if s == "webdavPreconditionFailed" {
+                    "webdavPreconditionFailed"
+                } else if s == "webdavRemoteConflict" {
+                    "webdavRemoteConflict"
+                } else if s == "webdavConflict" {
+                    "webdavConflict"
                 } else {
                     "webdavSyncFailed"
                 }
@@ -124,6 +132,9 @@ fn request(
 ) -> reqwest::RequestBuilder {
     http.request(method, url)
         .basic_auth(&c.user, Some(&c.password))
+        // Compression can change the representation ETag; PUT needs the stored
+        // resource validator. Never strip or rewrite an opaque server ETag.
+        .header(header::ACCEPT_ENCODING, "identity")
         .timeout(Duration::from_secs(c.options.timeout_secs))
 }
 
@@ -227,6 +238,7 @@ async fn download_once(
     Ok((root, Some(etag)))
 }
 
+#[derive(Serialize)]
 enum Root {
     Legacy(Snapshot),
     Manifest(chunks::Manifest),
@@ -345,6 +357,7 @@ pub async fn connect(
         ("webdav_user", c.user.as_str()),
         ("webdav_password", password),
         ("webdav_last_sync", ""),
+        ("webdav_last_attempt", ""),
         ("webdav_last_error", ""),
     ] {
         db::set_setting(&tx, key, value)?;
@@ -381,22 +394,39 @@ pub async fn resolve(db: &Db, kind: &str, key: &str, choice: &str) -> AppResult<
 }
 
 pub async fn run_if_connected(db: &Db, http: &Client) -> AppResult<bool> {
-    if !status(db).await?.connected {
-        return Ok(false);
+    // Timer, foreground and online events share this gate. Do not queue work
+    // behind an upload, or retry failed attempts faster than the chosen interval.
+    let Ok(_guard) = SYNC_LOCK.try_lock() else { return Ok(false); };
+    {
+        let conn = db.lock().await;
+        if credentials(&conn)?.is_none() || !ScheduleOptions::read(&conn)?.due(&conn, chrono::Utc::now())? {
+            return Ok(false);
+        }
     }
     let configured = { http_client(&*db.lock().await)? };
-    let _ = http; // caller's feed client may have a different route or stale pool
-    sync_now(db, &configured).await.map(|_| true)
+    let _ = http;
+    sync_locked(db, &configured).await.map(|_| true)
+}
+
+pub async fn try_sync_now(db: &Db, http: &Client) -> AppResult<usize> {
+    let _guard = SYNC_LOCK.try_lock().map_err(|_| AppError::code("webdavBusy"))?;
+    sync_locked(db, http).await
 }
 
 pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
     let _guard = SYNC_LOCK.lock().await;
+    sync_locked(db, http).await
+}
+
+async fn sync_locked(db: &Db, http: &Client) -> AppResult<usize> {
     let c = {
         let conn = db.lock().await;
         credentials(&conn)?.ok_or_else(|| AppError::code("webdavNotConnected"))?
     };
+    db::set_setting(&*db.lock().await, "webdav_last_attempt", &chrono::Utc::now().to_rfc3339())?;
     let result = progress::run(sync_inner(db, http, &c)).await;
     let conn = db.lock().await;
+    db::set_setting(&conn, "webdav_last_attempt", &chrono::Utc::now().to_rfc3339())?;
     match &result {
         Ok(_) => {
             db::set_setting(&conn, "webdav_last_sync", &chrono::Utc::now().to_rfc3339())?;
@@ -412,6 +442,8 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
                     "webdavRateLimited"
                 } else if matches!(error, AppError::Coded("webdavCancelled")) {
                     ""
+                } else if let AppError::Coded(code @ ("webdavPreconditionFailed" | "webdavRemoteConflict" | "webdavConflict")) = error {
+                    code
                 } else {
                     "webdavSyncFailed"
                 },
@@ -546,8 +578,16 @@ async fn upload_chunk(
 
 async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize> {
     let mut total = 0;
+    let mut refused = None;
     for _ in 0..3 {
         let (remote, etag) = download(http, c).await?;
+        use sha2::{Digest, Sha256};
+        let signature: [u8; 32] = Sha256::digest(serde_json::to_vec(&remote).map_err(|_| AppError::code("webdavInvalidData"))?).into();
+        if refused.as_ref() == Some(&(etag.clone(), signature)) {
+            // 412 with the same resource is not evidence of a second device.
+            // Keep the previous root and local edits; never fall back to a blind PUT.
+            return Err(AppError::code("webdavPreconditionFailed"));
+        }
         match &remote {
             Root::Legacy(snapshot) => chunks::stage_legacy(&mut *db.lock().await, snapshot)?,
             Root::Manifest(manifest) => {
@@ -649,7 +689,7 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
         }
         let mut req = request(http, c, reqwest::Method::PUT, c.url.join(FILE)?)
             .header(header::CONTENT_TYPE, "application/json");
-        req = if let Some(etag) = etag {
+        req = if let Some(etag) = &etag {
             req.header(header::IF_MATCH, etag)
         } else {
             req.header(header::IF_NONE_MATCH, "*")
@@ -675,7 +715,12 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
             resp.status(),
             StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT
         ) {
+            let conflict = resp.status() == StatusCode::CONFLICT;
             transport::drain(resp).await;
+            if conflict {
+                return Err(AppError::code("webdavRemoteConflict"));
+            }
+            refused = Some((etag, signature));
             continue;
         }
         transport::drain(resp).await;
@@ -708,6 +753,9 @@ mod tests {
         revision: u64,
         conflict: bool,
         missing_etag: bool,
+        representation_etag: bool,
+        reject_root: Option<u16>,
+        commit_then_fail: bool,
         deny: bool,
         fail_upload: bool,
         fail_root: bool,
@@ -844,7 +892,7 @@ mod tests {
                     let etag = if s.missing_etag {
                         None
                     } else if primary {
-                        Some(format!("\"{}\"", s.revision))
+                        Some(format!("\"{}{}\"", s.revision, if s.representation_etag && hdr("Accept-Encoding").as_deref() != Some("identity") { "-gzip" } else { "" }))
                     } else {
                         Some(object_etag(&body))
                     };
@@ -870,11 +918,10 @@ mod tests {
             } else {
                 "if-none-match: *".into()
             };
-            assert!(
-                headers.to_ascii_lowercase().contains(&expected),
-                "Missing condition: {headers}"
-            );
+            assert!(hdr("If-Match").is_some() || hdr("If-None-Match").is_some(), "Missing conditional write");
+            if !headers.to_ascii_lowercase().contains(&expected) { return (412,None,Vec::new()); }
             s.conditional_writes += 1;
+            if let Some(code) = s.reject_root { return (code,None,Vec::new()); }
             if s.fail_upload || s.fail_root {
                 return (500, None, Vec::new());
             }
@@ -889,6 +936,7 @@ mod tests {
             } else {
                 s.objects.insert(path.into(), bytes.to_vec());
             }
+            if s.commit_then_fail { s.commit_then_fail = false; return (503,None,Vec::new()); }
             return (201, None, Vec::new());
         }
         (400, None, Vec::new())
@@ -1236,6 +1284,59 @@ mod tests {
         sync_now(&a, &http).await.unwrap();
         assert!(server.lock().unwrap().body.is_some());
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn identity_representation_avoids_spurious_single_device_preconditions() {
+        let (url, server, task) = server().await;
+        let http = client(); let a = database();
+        seed(&a).await;
+        connect(&a,&http,&url,"u","p").await.unwrap();
+        sync_now(&a,&http).await.unwrap();
+        server.lock().unwrap().representation_etag = true;
+        // A negotiated representation has a validator inappropriate for PUT.
+        let raw = http.get(format!("{url}{FILE}")).header(header::ACCEPT_ENCODING,"gzip").send().await.unwrap();
+        let variant = raw.headers()[header::ETAG].to_str().unwrap().to_owned();
+        assert!(variant.contains("-gzip"));
+        let body = raw.bytes().await.unwrap();
+        assert_eq!(http.put(format!("{url}{FILE}")).header(header::IF_MATCH,variant).body(body).send().await.unwrap().status(),StatusCode::PRECONDITION_FAILED);
+        replication::set_progress(&*a.lock().await,1,0.5).unwrap();
+        sync_now(&a,&http).await.unwrap();
+        assert!(status(&a).await.unwrap().last_error.is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unchanged_root_rejection_is_not_reported_as_another_device_and_keeps_edits() {
+        let (url, server, task) = server().await;
+        let http = client(); let a = database();
+        seed(&a).await; connect(&a,&http,&url,"u","p").await.unwrap();
+        sync_now(&a,&http).await.unwrap();
+        let before = server.lock().unwrap().body.clone();
+        replication::set_progress(&*a.lock().await,1,0.75).unwrap();
+        for (status_code, code) in [(412,"webdavPreconditionFailed"),(409,"webdavRemoteConflict")] {
+            server.lock().unwrap().reject_root = Some(status_code);
+            assert!(matches!(sync_now(&a,&http).await,Err(AppError::Coded(c)) if c==code));
+            assert_eq!(status(&a).await.unwrap().last_error,Some(code));
+            assert_eq!(server.lock().unwrap().body,before);
+            assert_eq!(db::get_article(&*a.lock().await,1).unwrap().reading_progress,0.75);
+        }
+        server.lock().unwrap().reject_root = None;
+        server.lock().unwrap().commit_then_fail = true;
+        // A lost success response may cause our own retry to get 412. Re-read
+        // the new root and acknowledge it instead of claiming a foreign upload.
+        sync_now(&a,&http).await.unwrap();
+        assert_ne!(server.lock().unwrap().body,before);
+        assert!(!run_if_connected(&a,&http).await.unwrap(),"Manual sync also resets automatic cadence");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn background_and_manual_triggers_do_not_queue_behind_active_operations() {
+        let a = database();
+        let _guard = SYNC_LOCK.lock().await;
+        assert!(!run_if_connected(&a,&client()).await.unwrap());
+        assert!(matches!(try_sync_now(&a,&client()).await,Err(AppError::Coded("webdavBusy"))));
     }
 
     #[tokio::test]

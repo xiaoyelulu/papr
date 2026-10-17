@@ -12,6 +12,7 @@ import type { Palette, ResolvedMode } from "./store";
 import { useArticleActions } from "./hooks/articleActions";
 import { readCurrentItems } from "./lib/currentList";
 import { checkForUpdates } from "./lib/updater";
+import WebDavSyncButton from "./components/WebDavSyncButton";
 import { useToasts, toast as toastApi, reportError } from "./toast";
 import type { ArticleQuery, ArticleSummary, Feed } from "./types";
 import Sidebar from "./components/Sidebar";
@@ -134,7 +135,7 @@ export default function App() {
     if (!isMobile) return;
     const resume = () => {
       if (document.visibilityState !== "visible") return;
-      void api.webdavStatus().then((status) => status.connected ? api.webdavSync() : undefined).catch(() => {});
+      void api.webdavAutoSync().catch(() => {});
     };
     document.addEventListener("visibilitychange", resume);
     window.addEventListener("online", resume);
@@ -585,6 +586,7 @@ export default function App() {
               else setLibraryOpen(true);
             }}><Icon name={libraryOpen || selectedArticleId != null ? "chevron-left" : "menu"} size={21} /></button>
             <strong>{libraryOpen ? t("mobile.library") : selectedArticleId != null ? t("mobile.reading") : queryLabel}</strong>
+            <WebDavSyncButton className="tb-btn home-sync" onOpenSettings={() => openSettings("sync")} onToast={showToast} />
             <button className="tb-btn" aria-label={t("mobile.search")} onClick={() => setCpOpen(true)}><Icon name="search" size={19}/></button>
             <button className="tb-btn" aria-label={t("mobile.settings")} onClick={() => openSettings()}><Icon name="settings" size={19}/></button>
           </header>}

@@ -128,6 +128,9 @@ pub(super) async fn run<T>(
     if matches!(&result, Err(super::AppError::Coded("webdavCancelled"))) {
         edit(|s| s.value.phase = "cancelled");
     }
+    if matches!(&result, Err(super::AppError::Coded("webdavNeedsResolution"))) {
+        edit(|s| s.value.phase = "needsResolution");
+    }
     result
 }
 

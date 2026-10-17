@@ -1145,6 +1145,7 @@ function WebDavSection({ onToast }: { onToast: (m: string) => void }) {
     <div className="settings-group">
       <h3 className="settings-group-title">WebDAV</h3>
       <details className="webdav-help"><summary>{t("settings.webdav.scopeHelp")}</summary><p className="modal-hint">{t("settings.webdav.hint")}</p></details>
+      <WebDavScheduleControls onToast={onToast} />
       <WebDavNetworkControls disabled={active} onToast={onToast} />
       {transfer.data && (transfer.data.running || transfer.data.phase) && <div className="webdav-progress" role="status" aria-live="polite">
         <strong>{t(`settings.webdav.phases.${transfer.data.phase}`, { defaultValue: transfer.data.phase })}</strong>
@@ -1213,6 +1214,27 @@ function WebDavSection({ onToast }: { onToast: (m: string) => void }) {
       )}
     </div>
   );
+}
+
+function WebDavScheduleControls({ onToast }: { onToast: (message: string) => void }) {
+  const { t } = useTranslation();
+  const [minutes, setMinutes] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => { let live = true; api.webdavSchedule().then((o) => { if (live) setMinutes(o.intervalMinutes); }).catch(reportError); return () => { live = false; }; }, []);
+  if (minutes === null) return null;
+  const values = [...new Set([0, 1, 5, 15, 30, 60, 180, 300, 1440, minutes])].sort((a, b) => a - b);
+  const save = async () => {
+    setSaving(true);
+    try { await api.webdavSaveSchedule({ intervalMinutes: minutes }); onToast(t("settings.webdav.scheduleSaved")); }
+    catch (e) { reportError(e); } finally { setSaving(false); }
+  };
+  return <div className="webdav-schedule">
+    <Row label={t("settings.webdav.autoInterval")}>
+      <Select disabled={saving} value={String(minutes)} onChange={(value) => setMinutes(Number(value))} options={values.map((n) => ({ value: String(n), label: n === 0 ? t("settings.webdav.manualOnly") : n % 60 === 0 ? t("settings.webdav.everyHours", { count: n / 60 }) : t("settings.webdav.everyMinutes", { count: n }) }))} aria-label={t("settings.webdav.autoInterval")} />
+    </Row>
+    <p className="modal-hint">{t("settings.webdav.scheduleHint")}</p>
+    <button className="s-btn" disabled={saving} onClick={() => { void save(); }}>{t("settings.webdav.saveSchedule")}</button>
+  </div>;
 }
 
 function WebDavNetworkControls({ disabled, onToast }: { disabled: boolean; onToast: (message: string) => void }) {

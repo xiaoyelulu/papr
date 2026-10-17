@@ -3279,3 +3279,8 @@ button { font-family: inherit; }
 .webdav-path { color: var(--muted); overflow-wrap: anywhere; font-size: 12px; }
 .webdav-help { margin: 12px 0; color: var(--muted); font-size: 12px; }
 .webdav-help summary { cursor: pointer; }
+
+.webdav-schedule { margin: 12px 0 18px; }
+.sb-footer .sb-sync { display: flex; align-items: center; gap: 4px; width: auto; padding: 0 5px; white-space: nowrap; font-size: 11px; }
+.window[data-compact="true"] .mobile-nav .home-sync { width: auto; min-width: 72px; flex: 0 0 auto; display: flex; gap: 4px; padding: 0 6px; font-size: 12px; white-space: nowrap; }
+.home-sync .app-icon { flex-shrink: 0; }

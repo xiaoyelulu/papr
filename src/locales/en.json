@@ -627,11 +627,19 @@
         "relocating": "Copying into the new folder",
         "publishing": "Saving remote manifest",
         "done": "Sync complete",
-        "failed": "Transfer failed; retry available",
+        "failed": "Sync incomplete; see the error below",
         "cancelled": "Stopped; ready to resume",
-        "relocated": "Folder changed; ready to sync"
+        "relocated": "Folder changed; ready to sync",
+        "needsResolution": "Data conflicts need your review"
       },
-      "scopeHelp": "Synced data and upgrade notes"
+      "scopeHelp": "Synced data and upgrade notes",
+      "autoInterval": "Automatic sync interval",
+      "manualOnly": "Manual only",
+      "everyMinutes": "Every {{count}} minutes",
+      "scheduleHint": "Defaults to 1 hour. Failed or cancelled runs also wait for this interval. Manual only disables timer, foreground and network recovery triggers. Keep the app running on macOS; iOS background execution is limited; keep the app in the foreground to finish syncing. This preference is local to this device.",
+      "saveSchedule": "Save sync interval",
+      "scheduleSaved": "Sync interval saved and active",
+      "everyHours": "Every {{count}} hours"
     },
     "codex": {
       "login": "Sign in with ChatGPT",
@@ -727,7 +735,10 @@
     "moveTagToRoot": "Move tag to top level",
     "expandTag": "Expand tag",
     "collapseTag": "Collapse tag",
-    "tagCountHint": "Includes articles assigned here and to all descendants; each article is counted once."
+    "tagCountHint": "Includes articles assigned here and to all descendants; each article is counted once.",
+    "sync": "Sync",
+    "syncing": "Syncing",
+    "webdavSync": "Sync WebDAV now"
   },
   "error": {
     "db": "Database error: {{detail}}",
@@ -775,7 +786,7 @@
     "webdavInvalidData": "The WebDAV library file is invalid. Local data was not replaced.",
     "webdavVersion": "This WebDAV library was created by an unsupported protocol version. Update Papr.",
     "webdavNotConnected": "Connect a WebDAV server first.",
-    "webdavConflict": "Another device changed the library during sync. Please try again.",
+    "webdavConflict": "The remote manifest kept changing during sync. Nothing was overwritten; please retry later.",
     "webdavSyncFailed": "The last WebDAV sync failed. Choose Sync now to retry and see the error.",
     "syncProviderConflict": "Disconnect the current sync service before connecting another one.",
     "folderCycle": "A folder cannot be moved into itself or one of its descendants.",
@@ -798,7 +809,11 @@
     "webdavDirectoryOccupied": "The destination contains a different Papr library. Choose a new folder.",
     "webdavCopyUnsupported": "The server cannot copy this legacy library. Complete a regular sync before changing folders.",
     "webdavCancelled": "Transfer stopped. Completed chunks can be reused next time.",
-    "webdavRateLimited": "The server is rate-limiting requests. Retry later or reduce concurrency."
+    "webdavRateLimited": "The server is rate-limiting requests. Retry later or reduce concurrency.",
+    "webdavPreconditionFailed": "The server rejected the manifest version check (HTTP 412), but a fresh read found no change. This does not indicate another device is uploading. Retry; if it persists, check the WebDAV service or proxy ETag support.",
+    "webdavRemoteConflict": "The server refused to publish the manifest (HTTP 409). Check that the sync directory exists, is writable and is not locked by the server. The previous remote manifest is preserved.",
+    "webdavBusy": "A sync or connection operation is already running on this device. Please wait.",
+    "webdavInvalidSchedule": "Choose a sync interval from 0 to 1440 minutes."
   },
   "highlights": {
     "toolbarLabel": "Highlight color",
