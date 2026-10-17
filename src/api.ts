@@ -1,6 +1,7 @@
 // Thin typed wrappers over the Tauri command surface (src-tauri/src/commands.rs).
 
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { sortFolders } from "./lib/folders";
 import { imageBytes, type ImageBytesResponse } from "./lib/imageBytes";
 import type {
   AiEvent,
@@ -25,7 +26,7 @@ import type {
 } from "./types";
 
 // ── folders ──
-export const listFolders = () => invoke<Folder[]>("list_folders");
+export const listFolders = () => invoke<Folder[]>("list_folders").then(sortFolders);
 export const createFolder = (name: string, parentId: number | null = null) =>
   invoke<number>("create_folder", { name, parentId });
 export const moveFolder = (id: number, parentId: number | null) =>

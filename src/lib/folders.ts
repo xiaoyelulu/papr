@@ -2,6 +2,14 @@ import type { Folder } from "../types";
 
 export interface FolderNode { folder: Folder; children: FolderNode[]; depth: number }
 
+// Use the same locale on every device rather than the OS/UI language. Numeric
+// prefixes compare by value (2 before 10); Chinese names use pinyin collation.
+const folderNames = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+export function sortFolders(folders: Folder[]): Folder[] {
+  return [...folders].sort((a, b) => folderNames.compare(a.name, b.name)
+    || (a.name < b.name ? -1 : a.name > b.name ? 1 : a.id - b.id));
+}
+
 export function folderAncestors(id: number, folders: Folder[]): Folder[] {
   const byId = new Map(folders.map((folder) => [folder.id, folder]));
   const result: Folder[] = [];
@@ -35,6 +43,7 @@ export function folderDescendants(id: number, folders: Folder[]): Set<number> {
 }
 
 export function folderTree(folders: Folder[]): FolderNode[] {
+  folders = sortFolders(folders);
   const seen = new Set<number>();
   const byId = new Map(folders.map((folder) => [folder.id, folder]));
   const visit = (folder: Folder, depth: number): FolderNode => {
