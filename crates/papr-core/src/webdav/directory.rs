@@ -126,7 +126,7 @@ async fn relocate_inner(
                                     let body = fetch_chunk(http, source, &part).await?;
                                     chunks::cache(&*db.lock().await, &part, &body)?;
                                 }
-                                upload_chunk(db, http, destination, &part, target).await?;
+                                upload_chunk(db, http, destination, &part, target,false).await?;
                             }
                             412 => {
                                 transport::drain(response).await;

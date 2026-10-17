@@ -3,7 +3,7 @@ use super::*;
 use std::future::Future;
 
 pub(super) struct Failure {
-    error: AppError,
+    pub(super) error: AppError,
     retry: bool,
     after: Option<Duration>,
 }

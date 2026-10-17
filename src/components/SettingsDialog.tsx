@@ -1151,6 +1151,8 @@ function WebDavSection({ onToast }: { onToast: (m: string) => void }) {
         <strong>{t(`settings.webdav.phases.${transfer.data.phase}`, { defaultValue: transfer.data.phase })}</strong>
         {transfer.data.total > 0 && <><progress max={transfer.data.total} value={transfer.data.completed} aria-label={t("settings.webdav.chunkProgress")} /><span>{transfer.data.completed} / {transfer.data.total}</span></>}
         <p>{t("settings.webdav.transferBytes", { down: formatBytes(transfer.data.downloaded), up: formatBytes(transfer.data.uploaded) })}{transfer.data.running && transfer.data.bytesPerSecond > 0 ? ` · ${formatBytes(transfer.data.bytesPerSecond)}/s` : ""}</p>
+        {transfer.data.running && transfer.data.limit > 0 && <p>{t("settings.webdav.activeChunks", { count: transfer.data.active, limit: transfer.data.limit })}</p>}
+        {transfer.data.uploadTotal > 0 && <p>{t("settings.webdav.uploadSummary", { total: transfer.data.uploadTotal, planned: transfer.data.plannedChunks, reused: transfer.data.reusedChunks, uploaded: transfer.data.uploadedChunks })}</p>}
         {transfer.data.retries > 0 && <p>{t("settings.webdav.retryCount", { count: transfer.data.retries })}</p>}
         {transfer.data.running && <button className="s-btn" onClick={() => { void api.webdavCancel().catch(reportError); }}>{t("settings.webdav.cancelTransfer")}</button>}
       </div>}
@@ -1182,6 +1184,7 @@ function WebDavSection({ onToast }: { onToast: (m: string) => void }) {
               </div>
             </div>)}
           </div>}
+          <WebDavGarbageControls disabled={active} onBusyChange={setBusy} onToast={onToast} />
           <div className="webdav-directory">
             <label htmlFor="webdav-new-directory">{t("settings.webdav.newDirectory")}</label>
             <input id="webdav-new-directory" className="modal-input" disabled={active} value={directoryTarget} onChange={(e) => setDirectoryTarget(e.target.value)} placeholder="Papr" {...NO_AUTOCORRECT} />
@@ -1214,6 +1217,44 @@ function WebDavSection({ onToast }: { onToast: (m: string) => void }) {
       )}
     </div>
   );
+}
+
+function WebDavGarbageControls({ disabled, onBusyChange, onToast }: { disabled: boolean; onBusyChange: (busy: boolean) => void; onToast: (message: string) => void }) {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const [days, setDays] = useState(30);
+  const [preview, setPreview] = useState<api.WebDavGcPreview | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => { let live = true; api.getSetting("webdav_gc_retention_days").then((v) => { const n = Number(v); if (live && [7, 14, 30, 60, 90, 180, 365].includes(n)) setDays(n); }).catch(reportError); return () => { live = false; }; }, []);
+  const run = async (execute: boolean) => {
+    setBusy(true); onBusyChange(true); setError("");
+    try {
+      if (execute && preview) {
+        const result = await api.webdavGcExecute(preview.token);
+        setPreview(null);
+        onToast(t("settings.webdav.gc.deleted", { count: result.deletedChunks, bytes: formatBytes(result.deletedBytes) }));
+      } else setPreview(await api.webdavGcPreview(days));
+    } catch (e) { setError(errorText(e)); if (execute) setPreview(null); }
+    finally { setBusy(false); onBusyChange(false); await qc.invalidateQueries({ queryKey: ["webdav-progress"] }); }
+  };
+  return <details className="webdav-network webdav-gc">
+    <summary>{t("settings.webdav.gc.title")}</summary>
+    <p className="modal-hint">{t("settings.webdav.gc.hint")}</p>
+    <Row label={t("settings.webdav.gc.retention")}>
+      <Select aria-label={t("settings.webdav.gc.retention")} disabled={disabled || busy} value={String(days)} onChange={(v) => { setDays(Number(v)); setPreview(null); setError(""); }} options={[7, 14, 30, 60, 90, 180, 365].map((n) => ({ value: String(n), label: t("settings.webdav.gc.days", { count: n }) }))} />
+    </Row>
+    <button className="s-btn" disabled={disabled || busy} onClick={() => { setPreview(null); void run(false); }}>{t(busy ? "settings.webdav.gc.working" : "settings.webdav.gc.preview")}</button>
+    {error && <p className="ai-test-err" role="alert">{error}</p>}
+    {preview && <div className="webdav-gc-preview" role="status">
+      <p>{t("settings.webdav.gc.summary", { total: preview.totalChunks, referenced: preview.referencedChunks, waiting: preview.quarantinedChunks, count: preview.eligibleChunks, bytes: formatBytes(preview.eligibleBytes) })}</p>
+      {preview.eligibleChunks === 0 && <p className="modal-hint">{t("settings.webdav.gc.nothing")}</p>}
+      {preview.examples.length > 0 && <details><summary>{t("settings.webdav.gc.examples")}</summary><ul>{preview.examples.map((name) => <li key={name}>{name}</li>)}</ul></details>}
+      <button className="s-btn danger" disabled={disabled || busy || preview.eligibleChunks === 0} onClick={() => setConfirm(true)}>{t("settings.webdav.gc.clean")}</button>
+    </div>}
+    {confirm && preview && <ConfirmDialog title={t("settings.webdav.gc.confirmTitle")} message={t("settings.webdav.gc.confirm", { count: preview.eligibleChunks, bytes: formatBytes(preview.eligibleBytes), days: preview.retentionDays })} confirmLabel={t("settings.webdav.gc.clean")} onConfirm={() => { void run(true); }} onClose={() => setConfirm(false)} />}
+  </details>;
 }
 
 function WebDavScheduleControls({ onToast }: { onToast: (message: string) => void }) {

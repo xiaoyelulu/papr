@@ -3525,6 +3525,7 @@ dependencies = [
  "lol_html",
  "mail-parser",
  "opml",
+ "quick-xml 0.37.5",
  "reqwest 0.12.28",
  "rusqlite",
  "rusqlite_migration",

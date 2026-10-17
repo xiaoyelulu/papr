@@ -623,14 +623,19 @@
         "staging": "校验与暂存",
         "merging": "合并阅读状态与文章",
         "exporting": "压缩本机变化",
-        "upload": "上传分块",
+        "upload": "核对并上传分块",
         "relocating": "转存到新文件夹",
         "publishing": "保存远端清单",
         "done": "同步完成",
         "failed": "本次同步未完成，请查看下方错误",
         "cancelled": "已停止，可继续同步",
         "relocated": "目录切换完成，可继续同步",
-        "needsResolution": "有数据冲突，等待你选择保留版本"
+        "needsResolution": "有数据冲突，等待你选择保留版本",
+        "gcScanning": "正在扫描远端文件",
+        "gcDeleting": "正在回收已确认的无用文件",
+        "gcPreview": "回收预览已就绪",
+        "gcDone": "远端回收完成",
+        "checking": "正在核对远端已有分块"
       },
       "scopeHelp": "同步内容与升级说明",
       "autoInterval": "自动同步频率",
@@ -639,7 +644,24 @@
       "scheduleHint": "默认每 1 小时同步，失败或取消后也会等待所选间隔。仅手动模式下，定时器、回到前台和网络恢复均不会触发同步。macOS 需保持应用运行；iOS 后台运行受系统限制，请在前台完成同步。此设置仅保存在当前设备。",
       "saveSchedule": "保存同步频率",
       "scheduleSaved": "同步频率已保存，立即生效",
-      "everyHours": "每 {{count}} 小时"
+      "everyHours": "每 {{count}} 小时",
+      "activeChunks": "正在处理 {{count}} / {{limit}} 个分块",
+      "uploadSummary": "共 {{total}} 个分块 · 待核对 {{planned}} · 已复用 {{reused}} · 新上传 {{uploaded}}",
+      "gc": {
+        "title": "回收远端无用文件",
+        "hint": "仅手动执行。先扫描并记录文件首次失去引用的时间，保留期满后才允许删除；首次扫描通常不会回收空间。预览会保存回收记录，但不会删除文件。执行时重新核对清单、文件和其他设备活动，取得服务器独占锁后才会清理。默认保留 30 天。",
+        "retention": "未引用后的保留期",
+        "days": "{{count}} 天",
+        "working": "正在核对…",
+        "preview": "扫描并预览",
+        "summary": "发现 {{total}} 个分块，当前引用 {{referenced}} 个；{{waiting}} 个仍在保留期。可回收 {{count}} 个文件，约 {{bytes}}。",
+        "nothing": "当前没有可安全回收的文件。未引用的文件需从首次扫描起等待所选保留期，并在之后再次扫描。",
+        "examples": "查看待回收文件示例",
+        "clean": "回收预览中的文件",
+        "confirmTitle": "确认回收远端文件",
+        "confirm": "将回收预览中的 {{count}} 个文件（约 {{bytes}}）。这些文件首次被记录为未引用已至少 {{days}} 天，目前仍未被当前清单引用。执行前将再次检查；预览过期或文件变化时停止。当前引用的数据和其他文件会保留。此操作不能撤销。",
+        "deleted": "已回收 {{count}} 个远端文件，释放约 {{bytes}}。"
+      }
     },
     "codex": {
       "login": "使用 ChatGPT 登录",
@@ -813,7 +835,16 @@
     "webdavPreconditionFailed": "服务器拒绝了同步清单的版本校验（HTTP 412），重新读取后清单未变化；这不代表有其他设备正在上传。请重试；若持续出现，请检查 WebDAV 服务或代理的 ETag 支持。",
     "webdavRemoteConflict": "服务器拒绝发布同步清单（HTTP 409）。请检查同步目录是否存在、可写，或被服务端锁定；原有远端清单已保留。",
     "webdavBusy": "当前设备已有同步或连接操作正在进行，请等待完成。",
-    "webdavInvalidSchedule": "请选择 0–1440 分钟的同步频率。"
+    "webdavInvalidSchedule": "请选择 0–1440 分钟的同步频率。",
+    "webdavInventoryInvalid": "WebDAV 目录元数据不完整或格式不受支持，本次未执行回收。",
+    "webdavGcStale": "预览已过期，或清单、文件、服务器锁发生变化。请重新扫描后再回收；如已开始清理，可能有部分预览文件已回收。",
+    "webdavGcLockRequired": "网盘未提供可验证的目录独占锁，已停止回收以保护其他设备。普通同步仍可使用。",
+    "webdavGcBusy": "同步目录正在使用或锁定中。请等待其他同步结束后重试；异常中断的活动标记会在 24 小时后失效。",
+    "webdavGcSyncFirst": "请先成功完成一次新版 WebDAV 同步，再预览回收。",
+    "webdavGcIncomplete": "远端清单引用的部分文件缺失或大小不符，请先修复同步，本次不回收。",
+    "webdavGcUnlockFailed": "未能确认服务器锁已释放，请稍后重试；锁会按服务器超时自动失效。",
+    "webdavGcListingRequired": "网盘不支持所需的目录元数据查询，无法安全回收。",
+    "webdavGcRetention": "保留期必须为 7–365 天。"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",

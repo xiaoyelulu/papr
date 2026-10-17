@@ -335,6 +335,8 @@ pub fn run() {
             commands::webdav_save_schedule,
             commands::webdav_auto_sync,
             commands::webdav_relocate,
+            commands::webdav_gc_preview,
+            commands::webdav_gc_execute,
             commands::webdav_conflicts,
             commands::webdav_resolve,
             commands::webdav_connect,

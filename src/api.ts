@@ -433,7 +433,7 @@ export const cleanupFeedArticles = (id: number, token: string, automatic: boolea
 export const disableFeedLimit = (id: number) => invoke<void>("disable_feed_limit", { id });
 
 export interface WebDavNetworkOptions { concurrency: number; timeoutSecs: number; proxy: string }
-export interface WebDavProgress { running: boolean; phase: string; completed: number; total: number; downloaded: number; uploaded: number; bytesPerSecond: number; retries: number; elapsedMs: number }
+export interface WebDavProgress { running: boolean; phase: string; completed: number; total: number; downloaded: number; uploaded: number; bytesPerSecond: number; retries: number; elapsedMs: number; active: number; limit: number; uploadedChunks: number; downloadedChunks: number; reusedChunks: number; plannedChunks: number; uploadTotal: number }
 export const webdavNetworkOptions = () => invoke<WebDavNetworkOptions>("webdav_network_options");
 export const webdavSaveNetwork = (options: WebDavNetworkOptions) => invoke<void>("webdav_save_network", { options });
 export const webdavProgress = () => invoke<WebDavProgress>("webdav_progress");
@@ -444,3 +444,8 @@ export interface WebDavSchedule { intervalMinutes: number }
 export const webdavSchedule = () => invoke<WebDavSchedule>("webdav_schedule");
 export const webdavSaveSchedule = (options: WebDavSchedule) => invoke<void>("webdav_save_schedule", { options });
 export const webdavAutoSync = () => invoke<boolean>("webdav_auto_sync");
+
+export interface WebDavGcPreview { token: string; retentionDays: number; totalChunks: number; referencedChunks: number; quarantinedChunks: number; eligibleChunks: number; eligibleBytes: number; examples: string[] }
+export interface WebDavGcResult { deletedChunks: number; deletedBytes: number }
+export const webdavGcPreview = (retentionDays: number) => invoke<WebDavGcPreview>("webdav_gc_preview", { retentionDays });
+export const webdavGcExecute = (token: string) => invoke<WebDavGcResult>("webdav_gc_execute", { token });

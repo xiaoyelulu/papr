@@ -1448,6 +1448,16 @@ pub async fn webdav_auto_sync(app:AppHandle)->AppResult<bool> {
     result
 }
 #[tauri::command]
+pub async fn webdav_gc_preview(state:State<'_,AppState>,retention_days:u32)->AppResult<papr_core::webdav::GcPreview>{
+    let client=papr_core::webdav::http_client(&*state.db.lock().await)?;
+    papr_core::webdav::gc_preview(&state.db,&client,retention_days).await
+}
+#[tauri::command]
+pub async fn webdav_gc_execute(state:State<'_,AppState>,token:String)->AppResult<papr_core::webdav::GcResult>{
+    let client=papr_core::webdav::http_client(&*state.db.lock().await)?;
+    papr_core::webdav::gc_execute(&state.db,&client,&token).await
+}
+#[tauri::command]
 pub async fn webdav_relocate(state:State<'_,AppState>,directory:String)->AppResult<String> {
     let client=papr_core::webdav::http_client(&*state.db.lock().await)?;
     papr_core::webdav::relocate(&state.db,&client,&directory).await

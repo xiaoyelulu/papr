@@ -18,6 +18,13 @@ pub struct Progress {
     pub bytes_per_second: u64,
     pub retries: usize,
     pub elapsed_ms: u64,
+    pub active: usize,
+    pub limit: usize,
+    pub uploaded_chunks: usize,
+    pub downloaded_chunks: usize,
+    pub reused_chunks: usize,
+    pub planned_chunks: usize,
+    pub upload_total: usize,
 }
 struct State {
     value: Progress,
@@ -76,6 +83,13 @@ fn sample(s: &mut State) {
 pub(super) fn completed() {
     edit(|s| s.value.completed += 1);
 }
+pub(super) fn limit(n:usize){edit(|s|s.value.limit=n);}
+pub(super) fn upload_plan(total:usize,reused:usize){edit(|s|{s.value.upload_total=total;s.value.planned_chunks=total-reused;s.value.reused_chunks=reused;s.value.uploaded_chunks=0;});}
+pub(super) fn uploaded_chunk(uploaded:bool){edit(|s|{s.value.planned_chunks=s.value.planned_chunks.saturating_sub(1);if uploaded{s.value.uploaded_chunks+=1;}else{s.value.reused_chunks+=1;}});}
+pub(super) fn downloaded_chunk(){edit(|s|s.value.downloaded_chunks+=1);}
+pub(super) struct Job;
+pub(super) fn job()->Job{edit(|s|s.value.active+=1);Job}
+impl Drop for Job {fn drop(&mut self){edit(|s|s.value.active=s.value.active.saturating_sub(1));}}
 pub(super) fn retry() {
     edit(|s| s.value.retries += 1);
 }

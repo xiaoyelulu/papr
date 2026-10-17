@@ -623,14 +623,19 @@
         "staging": "Validating and staging",
         "merging": "Merging articles and reading state",
         "exporting": "Compressing local changes",
-        "upload": "Uploading chunks",
+        "upload": "Checking and uploading chunks",
         "relocating": "Copying into the new folder",
         "publishing": "Saving remote manifest",
         "done": "Sync complete",
         "failed": "Sync incomplete; see the error below",
         "cancelled": "Stopped; ready to resume",
         "relocated": "Folder changed; ready to sync",
-        "needsResolution": "Data conflicts need your review"
+        "needsResolution": "Data conflicts need your review",
+        "gcScanning": "Scanning remote files",
+        "gcDeleting": "Reclaiming verified unused files",
+        "gcPreview": "Cleanup preview ready",
+        "gcDone": "Remote cleanup completed",
+        "checking": "Checking existing remote chunks"
       },
       "scopeHelp": "Synced data and upgrade notes",
       "autoInterval": "Automatic sync interval",
@@ -639,7 +644,24 @@
       "scheduleHint": "Defaults to 1 hour. Failed or cancelled runs also wait for this interval. Manual only disables timer, foreground and network recovery triggers. Keep the app running on macOS; iOS background execution is limited; keep the app in the foreground to finish syncing. This preference is local to this device.",
       "saveSchedule": "Save sync interval",
       "scheduleSaved": "Sync interval saved and active",
-      "everyHours": "Every {{count}} hours"
+      "everyHours": "Every {{count}} hours",
+      "activeChunks": "Processing {{count}} / {{limit}} chunks",
+      "uploadSummary": "{{total}} chunks · {{planned}} pending · {{reused}} reused · {{uploaded}} newly uploaded",
+      "gc": {
+        "title": "Reclaim unused remote files",
+        "hint": "Manual only. Files are quarantined from the first scan that finds them unreferenced, then become eligible after the retention period. The first scan normally reclaims nothing. Preview saves tracking metadata without deleting files. Cleanup rechecks the manifest, files and active devices under a verified exclusive server lock. Default retention: 30 days.",
+        "retention": "Retention after becoming unreferenced",
+        "days": "{{count}} days",
+        "working": "Checking…",
+        "preview": "Scan and preview",
+        "summary": "{{total}} chunks found; {{referenced}} referenced; {{waiting}} still in retention. {{count}} files ({{bytes}}) can be reclaimed.",
+        "nothing": "No files can be safely reclaimed yet. Wait the retention period from their first unreferenced scan, then scan again.",
+        "examples": "Example files to reclaim",
+        "clean": "Reclaim previewed files",
+        "confirmTitle": "Reclaim remote files?",
+        "confirm": "Reclaim {{count}} previewed files ({{bytes}}), first recorded as unreferenced at least {{days}} days ago and still unreferenced now. Checks run again before deletion; changed or expired previews stop cleanup. Current referenced data and unrelated files are kept. This cannot be undone.",
+        "deleted": "Reclaimed {{count}} remote files ({{bytes}})."
+      }
     },
     "codex": {
       "login": "Sign in with ChatGPT",
@@ -813,7 +835,16 @@
     "webdavPreconditionFailed": "The server rejected the manifest version check (HTTP 412), but a fresh read found no change. This does not indicate another device is uploading. Retry; if it persists, check the WebDAV service or proxy ETag support.",
     "webdavRemoteConflict": "The server refused to publish the manifest (HTTP 409). Check that the sync directory exists, is writable and is not locked by the server. The previous remote manifest is preserved.",
     "webdavBusy": "A sync or connection operation is already running on this device. Please wait.",
-    "webdavInvalidSchedule": "Choose a sync interval from 0 to 1440 minutes."
+    "webdavInvalidSchedule": "Choose a sync interval from 0 to 1440 minutes.",
+    "webdavInventoryInvalid": "The server returned incomplete or unsupported directory metadata. Cleanup was not performed.",
+    "webdavGcStale": "The preview expired or the manifest, files or server lock changed. Scan again. If cleanup had started, some previewed files may already have been reclaimed.",
+    "webdavGcLockRequired": "A verifiable exclusive collection lock is unavailable. Cleanup stopped to protect other devices. Normal sync remains available.",
+    "webdavGcBusy": "The directory is in use or locked. Wait for other syncs to finish. Activity markers from interrupted clients expire after 24 hours.",
+    "webdavGcSyncFirst": "Complete a successful current WebDAV sync before previewing cleanup.",
+    "webdavGcIncomplete": "Some referenced files are missing or have a different size. Repair sync before cleanup.",
+    "webdavGcUnlockFailed": "Server lock release could not be confirmed. Retry later; server timeout releases the lock.",
+    "webdavGcListingRequired": "The server does not support the directory metadata required for safe cleanup.",
+    "webdavGcRetention": "Retention must be 7–365 days."
   },
   "highlights": {
     "toolbarLabel": "Highlight color",

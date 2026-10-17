@@ -14,6 +14,9 @@ use tokio::sync::Mutex;
 use url::Url;
 
 mod chunks;
+mod inventory;
+mod garbage;
+pub use garbage::{gc_preview, gc_execute, GcPreview, GcResult};
 mod directory;
 pub use directory::{directory_url, relocate};
 mod network;
@@ -142,6 +145,7 @@ fn http_error(status: StatusCode) -> AppError {
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => AppError::code("webdavAuthFailed"),
         StatusCode::TOO_MANY_REQUESTS => AppError::code("webdavRateLimited"),
+        StatusCode::LOCKED => AppError::code("webdavGcBusy"),
         _ => AppError::other(format!("WebDAV: HTTP {status}")),
     }
 }
@@ -424,7 +428,11 @@ async fn sync_locked(db: &Db, http: &Client) -> AppResult<usize> {
         credentials(&conn)?.ok_or_else(|| AppError::code("webdavNotConnected"))?
     };
     db::set_setting(&*db.lock().await, "webdav_last_attempt", &chrono::Utc::now().to_rfc3339())?;
-    let result = progress::run(sync_inner(db, http, &c)).await;
+    progress::start();
+    let result = match garbage::session_start(db,http,&c).await {
+        Ok(session) => {let result=progress::run(sync_inner(db,http,&c)).await;garbage::session_end(http,&c,&session).await;result},
+        Err(e) => {progress::finish(false);Err(e)},
+    };
     let conn = db.lock().await;
     db::set_setting(&conn, "webdav_last_attempt", &chrono::Utc::now().to_rfc3339())?;
     match &result {
@@ -541,9 +549,16 @@ async fn upload_chunk(
     c: &Credentials,
     p: &chunks::Part,
     target: &str,
-) -> AppResult<()> {
+    exists: bool,
+) -> AppResult<bool> {
     if receipt_valid(db, http, c, p, target).await? {
-        return Ok(());
+        return Ok(false);
+    }
+    if exists {
+        let (body,etag)=fetch_chunk_meta(http,c,p).await?;
+        chunks::cache(&*db.lock().await,p,&body)?;
+        save_receipt(db,target,p,etag).await?;
+        return Ok(false);
     }
     let body: bytes::Bytes = chunks::cached(&*db.lock().await, p)?
         .ok_or_else(|| AppError::code("webdavInvalidData"))?
@@ -568,15 +583,17 @@ async fn upload_chunk(
         let (bytes, etag) = fetch_chunk_meta(http, c, p).await?;
         chunks::cache(&*db.lock().await, p, &bytes)?;
         save_receipt(db, target, p, etag).await?;
+        return Ok(false);
     } else {
         let etag = transport::etag(&resp);
         transport::drain(resp).await;
         save_receipt(db, target, p, etag).await?;
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize> {
+    progress::limit(c.options.concurrency);
     let mut total = 0;
     let mut refused = None;
     for _ in 0..3 {
@@ -613,8 +630,10 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
                                 .acquire_many(memory_cost(&p))
                                 .await
                                 .expect("sync memory semaphore");
+                            let _job = progress::job();
                             let body = fetch_chunk(http, c, &p).await?;
                             chunks::cache(&*db.lock().await, &p, &body)?;
+                            progress::downloaded_chunk();
                             progress::completed();
                             Ok::<_, AppError>(())
                         }
@@ -642,6 +661,7 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
                 .collect::<std::collections::BTreeSet<_>>(),
             _ => Default::default(),
         };
+        progress::upload_plan(outgoing.chunks.len(),outgoing.chunks.iter().filter(|p|remote_parts.contains(p.hash.as_str())).count());
         if etag.is_some() && matches!(&remote,Root::Manifest(m) if *m==outgoing) {
             chunks::acknowledge(&*db.lock().await)?;
             chunks::prune(&*db.lock().await)?;
@@ -659,11 +679,20 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
             .filter(|p| !remote_parts.contains(p.hash.as_str()))
             .cloned()
             .collect();
+        // A failed publication can leave many valid objects outside the root.
+        // One bounded directory stat avoids sending their bodies again. Fresh
+        // small incremental runs avoid this extra round trip.
+        let retrying=db::get_setting(&*db.lock().await,"webdav_last_error")?.is_some_and(|s|!s.is_empty());
+        progress::phase("checking",pending.len());
+        let existing=if pending.len()>64 || etag.is_none() || retrying {
+            inventory::list(http,c).await.ok().flatten().map(|l|l.objects).unwrap_or_default()
+        } else {Default::default()};
+        let pending:Vec<_>=pending.into_iter().map(|p|{let found=existing.get(&chunks::path(&p)).is_some_and(|o|o.bytes==p.bytes as u64);(p,found)}).collect();
         progress::phase("upload", pending.len());
         let memory = tokio::sync::Semaphore::new(MEMORY_KIB);
         let target = upload_target(c);
         let mut jobs = stream::iter(pending)
-            .map(|p| {
+            .map(|(p,exists)| {
                 let memory = &memory;
                 let target = &target;
                 async move {
@@ -671,7 +700,9 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
                         .acquire_many(memory_cost(&p))
                         .await
                         .expect("sync memory semaphore");
-                    upload_chunk(db, http, c, &p, target).await?;
+                    let _job=progress::job();
+                    let uploaded=upload_chunk(db, http, c, &p, target,exists).await?;
+                    progress::uploaded_chunk(uploaded);
                     progress::completed();
                     Ok::<_, AppError>(())
                 }
@@ -768,6 +799,13 @@ mod tests {
         copy_unsupported: bool,
         copy_fail_after: Option<usize>,
         change_source_during_copy: bool,
+        clock_offset: i64,
+        modified: std::collections::BTreeMap<String,i64>,
+        lock_unsupported: bool,
+        gc_locked: bool,
+        gc_deletes: usize,
+        fail_delete: bool,
+        expire_gc_delete: bool,
     }
     fn object_etag(body: &[u8]) -> String {
         use sha2::{Digest, Sha256};
@@ -791,6 +829,40 @@ mod tests {
         };
         if s.deny {
             return (401, None, Vec::new());
+        }
+        let now=chrono::Utc::now().timestamp()+s.clock_offset;
+        if method=="LOCK" {
+            if s.lock_unsupported{return (405,None,Vec::new());}
+            if s.gc_locked && !hdr("If").is_some_and(|h|h.contains("opaquelocktoken:papr-test")){return (423,None,Vec::new());}
+            s.gc_locked=true;
+            return (200,None,b"<d:prop xmlns:d=\"DAV:\"><d:lockdiscovery><d:activelock><d:lockscope><d:exclusive/></d:lockscope><d:locktype><d:write/></d:locktype><d:depth>infinity</d:depth><d:timeout>Second-120</d:timeout><d:locktoken><d:href>opaquelocktoken:papr-test</d:href></d:locktoken></d:activelock></d:lockdiscovery></d:prop>".to_vec());
+        }
+        if method=="UNLOCK" {
+            assert_eq!(hdr("Lock-Token").as_deref(),Some("<opaquelocktoken:papr-test>"));
+            s.gc_locked=false;return (204,None,Vec::new());
+        }
+        if s.gc_locked && matches!(method,"PUT"|"DELETE"|"COPY"|"MKCOL") && !hdr("If").is_some_and(|h|h.contains("opaquelocktoken:papr-test")){return (423,None,Vec::new());}
+        if method=="PROPFIND" {
+            assert_eq!(hdr("Depth").as_deref(),Some("1"));
+            let mut xml=String::from("<d:multistatus xmlns:d=\"DAV:\">");
+            for (name,body) in &s.objects {
+                let modified=chrono::DateTime::from_timestamp(s.modified.get(name).copied().unwrap_or(1_700_000_000),0).unwrap().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                xml.push_str(&format!("<d:response><d:href>{name}</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:getcontentlength>{}</d:getcontentlength><d:getetag>{}</d:getetag><d:getlastmodified>{modified}</d:getlastmodified><d:resourcetype/></d:prop></d:propstat></d:response>",body.len(),object_etag(body)));
+            }
+            xml.push_str("</d:multistatus>");return (207,None,xml.into_bytes());
+        }
+        if method=="DELETE" {
+            if object && s.expire_gc_delete {s.gc_locked=false;return (412,None,Vec::new());}
+            if s.fail_delete{return (500,None,Vec::new());}
+            if let Some(body)=s.objects.get(path){
+                if object {assert_eq!(hdr("If-Match").as_deref(),Some(object_etag(body).as_str()));assert!(s.gc_locked);s.gc_deletes+=1;}
+                s.objects.remove(path);s.modified.remove(path);return (204,None,Vec::new());
+            }
+            return (404,None,Vec::new());
+        }
+        if inventory::session_name(path.rsplit('/').next().unwrap_or("")) {
+            if method=="PUT" {let etag=object_etag(bytes);s.objects.insert(path.into(),bytes.to_vec());s.modified.insert(path.into(),now);return (201,Some(etag),Vec::new());}
+            if method=="DELETE" {s.objects.remove(path);return (204,None,Vec::new());}
         }
         if method == "MKCOL" {
             return (405, None, Vec::new());
@@ -879,6 +951,7 @@ mod tests {
                 }
                 let etag = object_etag(bytes);
                 s.objects.insert(path.into(), bytes.to_vec());
+                s.modified.insert(path.into(),now);
                 return (201, Some(etag), Vec::new());
             }
         } else if method == "GET" {
@@ -921,7 +994,7 @@ mod tests {
             assert!(hdr("If-Match").is_some() || hdr("If-None-Match").is_some(), "Missing conditional write");
             if !headers.to_ascii_lowercase().contains(&expected) { return (412,None,Vec::new()); }
             s.conditional_writes += 1;
-            if let Some(code) = s.reject_root { return (code,None,Vec::new()); }
+            if primary {if let Some(code) = s.reject_root { return (code,None,Vec::new()); }}
             if s.fail_upload || s.fail_root {
                 return (500, None, Vec::new());
             }
@@ -935,6 +1008,7 @@ mod tests {
                 s.revision += 1;
             } else {
                 s.objects.insert(path.into(), bytes.to_vec());
+                s.modified.insert(path.into(),now);
             }
             if s.commit_then_fail { s.commit_then_fail = false; return (503,None,Vec::new()); }
             return (201, None, Vec::new());
@@ -1013,7 +1087,9 @@ mod tests {
                     } else {
                         ""
                     };
-                    let response=format!("HTTP/1.1 {code} Test\r\n{etag}{retry}Content-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+                    let date=chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp()+shared.lock().unwrap().clock_offset,0).unwrap().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                    let token=if method=="LOCK" && code==200 {"Lock-Token: <opaquelocktoken:papr-test>\r\n"} else {""};
+                    let response=format!("HTTP/1.1 {code} Test\r\n{etag}{retry}{token}Date: {date}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
                     let _ = socket.write_all(response.as_bytes()).await;
                     if method != "HEAD" {
                         let _ = socket.write_all(&body).await;
@@ -1022,6 +1098,12 @@ mod tests {
             }
         });
         (url, state, task)
+    }
+    async fn gc_preview_wait(db:&Db,http:&Client,days:u32)->AppResult<GcPreview>{
+        for _ in 0..9000 {let r=gc_preview(db,http,days).await;if matches!(r,Err(AppError::Coded("webdavBusy"))){tokio::time::sleep(Duration::from_millis(10)).await;}else{return r;}}panic!("GC test lock timeout")
+    }
+    async fn gc_execute_wait(db:&Db,http:&Client,token:&str)->AppResult<GcResult>{
+        for _ in 0..9000 {let r=gc_execute(db,http,token).await;if matches!(r,Err(AppError::Coded("webdavBusy"))){tokio::time::sleep(Duration::from_millis(10)).await;}else{return r;}}panic!("GC test lock timeout")
     }
     fn database() -> Db {
         Mutex::new(db::open(std::path::Path::new(":memory:")).unwrap())
@@ -1337,6 +1419,71 @@ mod tests {
         let _guard = SYNC_LOCK.lock().await;
         assert!(!run_if_connected(&a,&client()).await.unwrap());
         assert!(matches!(try_sync_now(&a,&client()).await,Err(AppError::Coded("webdavBusy"))));
+    }
+
+    #[tokio::test]
+    async fn gc_quarantines_before_previewed_conditional_deletion_and_fences_old_writers() {
+        let (url,server,task)=server().await;let http=client();let a=database();seed(&a).await;
+        connect(&a,&http,&url,"u","p").await.unwrap();sync_now(&a,&http).await.unwrap();
+        replication::set_progress(&*a.lock().await,1,0.5).unwrap();sync_now(&a,&http).await.unwrap();
+        server.lock().unwrap().objects.insert("/papr/holiday.jpg".into(),b"unrelated".to_vec());
+        let original_root=server.lock().unwrap().body.clone();
+        let first=gc_preview_wait(&a,&http,7).await.unwrap();assert_eq!(first.eligible_chunks,0);assert!(first.quarantined_chunks>0);assert_eq!(server.lock().unwrap().gc_deletes,0);
+        assert_eq!(server.lock().unwrap().body,original_root);
+        server.lock().unwrap().clock_offset=8*86400;
+        let ready=gc_preview_wait(&a,&http,7).await.unwrap();assert!(ready.eligible_chunks>0);
+        let before_etag=format!("\"{}\"",server.lock().unwrap().revision);
+        let deleted=gc_execute_wait(&a,&http,&ready.token).await.unwrap();assert_eq!(deleted.deleted_chunks,ready.eligible_chunks);assert_eq!(deleted.deleted_bytes,ready.eligible_bytes);
+        let state=server.lock().unwrap();assert!(!state.gc_locked);assert_eq!(state.objects["/papr/holiday.jpg"],b"unrelated");
+        let old:chunks::Manifest=serde_json::from_slice(original_root.as_ref().unwrap()).unwrap();let new:chunks::Manifest=serde_json::from_slice(state.body.as_ref().unwrap()).unwrap();assert_eq!(old,new);
+        for p in new.chunks {assert!(state.objects.contains_key(&format!("/papr/{}",chunks::path(&p))));}drop(state);
+        let stale_write=http.put(format!("{url}{FILE}")).header(header::IF_MATCH,before_etag).body(original_root.unwrap()).send().await.unwrap();assert_eq!(stale_write.status(),StatusCode::PRECONDITION_FAILED);
+        assert!(matches!(gc_execute_wait(&a,&http,&ready.token).await,Err(AppError::Coded("webdavGcStale"))));
+        assert_eq!(gc_preview_wait(&a,&http,7).await.unwrap().eligible_chunks,0);sync_now(&a,&http).await.unwrap();task.abort();
+    }
+    #[tokio::test]
+    async fn gc_refuses_active_clients_unsupported_locks_and_changed_previews() {
+        let (url,server,task)=server().await;let http=client();let a=database();seed(&a).await;
+        connect(&a,&http,&url,"u","p").await.unwrap();sync_now(&a,&http).await.unwrap();
+        replication::set_progress(&*a.lock().await,1,0.25).unwrap();sync_now(&a,&http).await.unwrap();
+        let c=credentials(&*a.lock().await).unwrap().unwrap();let session=garbage::session_start(&a,&http,&c).await.unwrap();
+        assert!(matches!(gc_preview_wait(&a,&http,7).await,Err(AppError::Coded("webdavGcBusy"))));assert!(!server.lock().unwrap().gc_locked);garbage::session_end(&http,&c,&session).await;
+        server.lock().unwrap().lock_unsupported=true;assert!(matches!(gc_preview_wait(&a,&http,7).await,Err(AppError::Coded("webdavGcLockRequired"))));server.lock().unwrap().lock_unsupported=false;
+        gc_preview_wait(&a,&http,7).await.unwrap();server.lock().unwrap().clock_offset=8*86400;
+        let ready=gc_preview_wait(&a,&http,7).await.unwrap();assert!(ready.eligible_chunks>0);
+        replication::set_progress(&*a.lock().await,1,0.75).unwrap();sync_now(&a,&http).await.unwrap();
+        assert!(matches!(gc_execute_wait(&a,&http,&ready.token).await,Err(AppError::Coded("webdavGcStale"))));assert_eq!(server.lock().unwrap().gc_deletes,0);assert!(!server.lock().unwrap().gc_locked);
+        let ready=gc_preview_wait(&a,&http,7).await.unwrap();let name=ready.examples.first().unwrap().clone();server.lock().unwrap().objects.insert(format!("/papr/{name}"),b"changed".to_vec());
+        assert!(matches!(gc_execute_wait(&a,&http,&ready.token).await,Err(AppError::Coded("webdavGcStale"))));assert_eq!(server.lock().unwrap().gc_deletes,0);task.abort();
+    }
+    #[tokio::test]
+    async fn gc_lock_loss_failure_and_reintroduced_references_never_delete_current_data() {
+        let (url,server,task)=server().await;let http=client();let a=database();seed(&a).await;
+        connect(&a,&http,&url,"u","p").await.unwrap();sync_now(&a,&http).await.unwrap();let original=server.lock().unwrap().body.clone().unwrap();
+        replication::set_progress(&*a.lock().await,1,0.25).unwrap();sync_now(&a,&http).await.unwrap();
+        gc_preview_wait(&a,&http,7).await.unwrap();server.lock().unwrap().clock_offset=8*86400;
+        let ready=gc_preview_wait(&a,&http,7).await.unwrap();assert!(ready.eligible_chunks>0);
+        server.lock().unwrap().expire_gc_delete=true;
+        assert!(matches!(gc_execute_wait(&a,&http,&ready.token).await,Err(AppError::Coded("webdavGcStale"))));assert_eq!(server.lock().unwrap().gc_deletes,0);assert!(!server.lock().unwrap().gc_locked);
+        server.lock().unwrap().expire_gc_delete=false;
+        let ready=gc_preview_wait(&a,&http,7).await.unwrap();server.lock().unwrap().fail_delete=true;
+        assert!(gc_execute_wait(&a,&http,&ready.token).await.is_err());assert_eq!(server.lock().unwrap().gc_deletes,0);assert!(!server.lock().unwrap().gc_locked);server.lock().unwrap().fail_delete=false;
+        // Another published root reintroduces the old state chunk. Its prior
+        // quarantine entry must disappear even though the object is very old.
+        {let mut s=server.lock().unwrap();s.body=Some(original.clone());s.revision+=1;}
+        let ready=gc_preview_wait(&a,&http,7).await.unwrap();assert_eq!(ready.eligible_chunks,0);assert_eq!(server.lock().unwrap().gc_deletes,0);
+        let manifest:chunks::Manifest=serde_json::from_slice(&original).unwrap();assert!(manifest.chunks.iter().all(|p|server.lock().unwrap().objects.contains_key(&format!("/papr/{}",chunks::path(p)))));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn orphaned_uploads_without_local_receipts_are_verified_instead_of_put_again() {
+        let (url,server,task)=server().await;let http=client();let a=database();many(&a).await;
+        connect(&a,&http,&url,"u","p").await.unwrap();server.lock().unwrap().fail_root=true;assert!(sync_now(&a,&http).await.is_err());
+        let puts=server.lock().unwrap().chunk_puts;assert!(puts>0);assert!(server.lock().unwrap().body.is_none());
+        a.lock().await.execute("DELETE FROM webdav_upload_receipts",[]).unwrap();server.lock().unwrap().fail_root=false;
+        sync_now(&a,&http).await.unwrap();let state=server.lock().unwrap();assert_eq!(state.chunk_puts,puts,"Existing orphan bodies must not be PUT again even without local receipts");assert!(state.chunk_gets>0);drop(state);
+        assert_eq!(progress().uploaded_chunks,0);assert!(progress().reused_chunks>0);task.abort();
     }
 
     #[tokio::test]
