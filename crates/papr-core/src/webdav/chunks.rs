@@ -1,4 +1,4 @@
-//! Version 6: immutable, content-addressed gzip chunks and a conditional root.
+//! Version 7 (reads v6): immutable, content-addressed gzip chunks and a conditional root.
 //! Cache/staging tables are disk-backed SQLite tables, never whole-library Vecs.
 use super::*;
 use flate2::{read::MultiGzDecoder, write::GzEncoder, Compression};
@@ -41,13 +41,13 @@ pub(super) struct Manifest {
 impl Manifest {
     pub fn empty() -> Self {
         Self {
-            version: 6,
+            version: 7,
             format: "papr-gzip-jsonl-sha256".into(),
             chunks: vec![],
         }
     }
     pub fn validate(&self) -> AppResult<()> {
-        if self.version != 6 || self.format != "papr-gzip-jsonl-sha256" {
+        if !matches!(self.version, 6 | 7) || self.format != "papr-gzip-jsonl-sha256" {
             return Err(AppError::code("webdavVersion"));
         }
         let mut seen = BTreeSet::new();
@@ -269,6 +269,14 @@ pub(super) fn export(conn: &mut Connection) -> AppResult<Manifest> {
 /// has passed integrity checks. Interrupted downloads reuse verified objects.
 pub(super) fn stage(conn: &mut Connection, manifest: &Manifest) -> AppResult<()> {
     manifest.validate()?;
+    let mut legacy_folders = Vec::new();
+    if manifest.version == 6 {
+        for p in manifest.chunks.iter().filter(|p| p.kind == "folder") {
+            let body = cached(conn, p)?.ok_or_else(invalid)?;
+            legacy_folders.extend(decode(p, &body)?);
+        }
+    }
+    let paths = replication::legacy_folder_paths(&legacy_folders)?;
     let tx = conn.transaction()?;
     let old: BTreeSet<String> = {
         let mut s = tx.prepare("SELECT hash FROM webdav_incoming_chunks")?;
@@ -297,7 +305,10 @@ pub(super) fn stage(conn: &mut Connection, manifest: &Manifest) -> AppResult<()>
             continue;
         }
         let body = cached(&tx, p)?.ok_or_else(invalid)?;
-        for r in decode(p, &body)? {
+        for mut r in decode(p, &body)? {
+            if manifest.version == 6 {
+                replication::convert_legacy_folder(&mut r, &paths);
+            }
             tx.execute(
                 "INSERT INTO webdav_incoming(kind,key,record,chunk,clock,nonce) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![

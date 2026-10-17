@@ -1478,7 +1478,7 @@ fn cmd_opml(path: &Path, cmd: OpmlCmd) -> Result<String, AxiError> {
         OpmlCmd::Export { out } => {
             let conn = open_ro(path)?;
             let feeds = db::feeds_for_export(&conn).map_err(db_err)?;
-            let xml = papr_core::opml::build_with_folders(&feeds, &db::list_folders(&conn).map_err(db_err)?)
+            let xml = db::export_opml(&conn)
                 .map_err(|e| AxiError::runtime(format!("OPML build failed: {e}")))?;
             match out {
                 Some(file) => {

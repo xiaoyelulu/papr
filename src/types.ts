@@ -69,6 +69,7 @@ export interface Feed {
    *  or the embedded web view of the original page. `null` follows the default
    *  behaviour (reader view, honouring the global auto-extract preference). */
   openMode: "reader" | "extracted" | "web" | null;
+  maxArticles: number | null;
 }
 
 export interface Enclosure {

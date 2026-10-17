@@ -186,6 +186,16 @@ pub fn build_with_folders(feeds: &[(String, String, Option<String>)], folders: &
     doc.to_string().map_err(|e| AppError::Opml(e.to_string()))
 }
 
+pub fn build_from_paths(feeds:&[(String,String,Vec<String>)])->AppResult<String> {
+    let mut doc=OPML{head:Some(Head{title:Some("Papr Subscriptions".into()),..Head::default()}),..OPML::default()};
+    for (title,url,path) in feeds {
+        if url.trim().is_empty(){continue;}
+        let outline=Outline{text:title.clone(),xml_url:Some(url.trim().to_owned()),r#type:Some("rss".into()),..Outline::default()};
+        insert_path(&mut doc.body.outlines,path,vec![outline]);
+    }
+    doc.to_string().map_err(|e|AppError::Opml(e.to_string()))
+}
+
 fn insert_path(nodes: &mut Vec<Outline>, path: &[String], feeds: Vec<Outline>) {
     let Some(name) = path.first() else { nodes.extend(feeds); return; };
     let index = nodes.iter().position(|node| node.xml_url.is_none() && node.text == *name).unwrap_or_else(|| {

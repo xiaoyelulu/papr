@@ -120,7 +120,7 @@ def main():
         'CFBundleDevelopmentRegion':'en','CFBundleExecutable':'Papr',
         'CFBundleIdentifier':config['identifier'],'CFBundleInfoDictionaryVersion':'6.0',
         'CFBundleName':'Papr','CFBundleDisplayName':'Papr','CFBundlePackageType':'APPL',
-        'CFBundleShortVersionString':config['version'],'CFBundleVersion':'5',
+        'CFBundleShortVersionString':config['version'],'CFBundleVersion':'6',
         'MinimumOSVersion':MIN_IOS,'LSRequiresIPhoneOS':True,'UIDeviceFamily':[1,2],
         'CFBundleSupportedPlatforms':['iPhoneOS'],'UIRequiredDeviceCapabilities':['arm64'],
         # iOS 14+ dictionary-based launch screens avoid a compiled storyboard.

@@ -210,6 +210,10 @@ fn specs() -> Vec<Spec> {
 fn tag_key(alias: &str) -> String {
     format!("(WITH RECURSIVE c(name,parent_id,depth) AS (SELECT lower({alias}.name),{alias}.parent_id,0 UNION ALL SELECT lower(p.name),p.parent_id,c.depth+1 FROM tags p JOIN c ON p.id=c.parent_id) SELECT json_group_array(name) FROM (SELECT name FROM c ORDER BY depth DESC))")
 }
+fn folder_key(alias: &str) -> String {
+    tag_key(alias).replace("FROM tags ", "FROM folders ")
+}
+
 fn tag_specs_v25() -> Vec<Spec> {
     let mut all = specs();
     for spec in &mut all {
@@ -243,6 +247,30 @@ fn tag_specs_v25() -> Vec<Spec> {
 }
 fn current_specs() -> Vec<Spec> {
     let mut all = tag_specs_v25();
+    for spec in &mut all {
+        if spec.kind == "folder" {
+            spec.key = folder_key("t");
+            spec.columns
+                .iter_mut()
+                .find(|(c, _)| *c == "parent_id")
+                .unwrap()
+                .1 = format!(
+                "(SELECT {} || '' FROM folders q WHERE q.id=t.parent_id)",
+                folder_key("q")
+            );
+        }
+        if spec.kind == "feed" {
+            spec.columns.push(("max_articles", "t.max_articles".into()));
+            spec.columns
+                .iter_mut()
+                .find(|(c, _)| *c == "folder_id")
+                .unwrap()
+                .1 = format!(
+                "(SELECT {} || '' FROM folders q WHERE q.id=t.folder_id)",
+                folder_key("q")
+            );
+        }
+    }
     for (kind, key, fields) in [
         (
             "ai_config",
@@ -261,6 +289,286 @@ fn current_specs() -> Vec<Spec> {
         });
     }
     all
+}
+
+/// Folder keys are complete paths, like tag keys. Repair descendants after an
+/// ancestor move, preserving tombstones for the old paths and feed references.
+fn repair_folder_sql() -> String {
+    let mut sql=String::from("UPDATE webdav_control SET clock=max(clock+1,CAST(unixepoch('subsec')*1000 AS INTEGER)) WHERE id=1;");
+    for spec in current_specs()
+        .into_iter()
+        .filter(|s| ["folder", "feed"].contains(&s.kind))
+    {
+        let data = payload(&spec);
+        sql.push_str(&format!("UPDATE webdav_records SET deleted=1,clock=(SELECT clock FROM webdav_control WHERE id=1),nonce=lower(hex(randomblob(16))) WHERE kind='{kind}' AND deleted=0 AND key NOT IN (SELECT {key} FROM {table} t WHERE {filter});
+         INSERT INTO webdav_records SELECT '{kind}',{key},(SELECT clock FROM webdav_control WHERE id=1),lower(hex(randomblob(16))),0,{data} FROM {table} t WHERE {filter}
+         ON CONFLICT(kind,key) DO UPDATE SET clock=excluded.clock,nonce=excluded.nonce,deleted=0,data=excluded.data WHERE webdav_records.deleted!=0 OR webdav_records.data IS NOT excluded.data;",kind=spec.kind,key=spec.key,table=spec.table,filter=spec.filter));
+    }
+    sql
+}
+
+pub(crate) fn legacy_folder_paths(
+    records: &[Record],
+) -> AppResult<std::collections::BTreeMap<String, String>> {
+    let folders: std::collections::BTreeMap<_, _> = records
+        .iter()
+        .filter(|r| r.kind == "folder")
+        .map(|r| {
+            (
+                r.key.clone(),
+                r.data["parent_id"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    let mut paths = std::collections::BTreeMap::new();
+    for key in folders.keys() {
+        let mut names = Vec::new();
+        let mut current = Some(key.clone());
+        while let Some(name) = current {
+            if names.contains(&name) || names.len() > 100 {
+                return Err(invalid());
+            }
+            current = folders.get(&name).cloned().flatten();
+            names.push(name);
+        }
+        names.reverse();
+        paths.insert(
+            key.clone(),
+            serde_json::to_string(&names).map_err(|_| invalid())?,
+        );
+    }
+    Ok(paths)
+}
+pub(crate) fn convert_legacy_folder(
+    r: &mut Record,
+    paths: &std::collections::BTreeMap<String, String>,
+) {
+    let path = |s: &str| {
+        paths
+            .get(s)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([s]).to_string())
+    };
+    if r.kind == "folder" {
+        r.key = path(&r.key);
+        r.data["parent_id"] = r.data["parent_id"]
+            .as_str()
+            .map(|s| Value::String(path(s)))
+            .unwrap_or(Value::Null);
+    }
+    if r.kind == "feed" {
+        r.data["folder_id"] = r.data["folder_id"]
+            .as_str()
+            .map(|s| Value::String(path(s)))
+            .unwrap_or(Value::Null);
+    }
+}
+pub(crate) fn upgrade_legacy_folders(records: &mut [Record]) -> AppResult<()> {
+    let paths = legacy_folder_paths(records)?;
+    for r in records {
+        convert_legacy_folder(r, &paths);
+    }
+    Ok(())
+}
+
+/// v28 metadata-only upgrade. Keep revisions, baselines and both conflict
+/// versions; never scan or duplicate article bodies in the 1.3 GB library.
+pub(crate) fn upgrade_folder_scope(conn: &mut Connection) -> AppResult<()> {
+    let pending: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM webdav_folder_scope_upgrade)",
+        [],
+        |r| r.get(0),
+    )?;
+    if !pending {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut local = Vec::new();
+    visit(
+        &tx,
+        &format!("SELECT {RECORD_JSON} FROM webdav_records WHERE kind IN ('folder','feed')"),
+        |r| {
+            local.push(r);
+            Ok(())
+        },
+    )?;
+    let paths = legacy_folder_paths(&local)?;
+    // Save the original metadata for diagnosing migrations without article/secret data.
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS webdav_folder_migration_backup(kind TEXT,key TEXT,record TEXT,PRIMARY KEY(kind,key));")?;
+    for r in &local {
+        tx.execute(
+            "INSERT OR IGNORE INTO webdav_folder_migration_backup VALUES(?1,?2,?3)",
+            params![
+                r.kind,
+                r.key,
+                serde_json::to_string(r).map_err(|_| invalid())?
+            ],
+        )?;
+    }
+    for kind in ["folder", "feed"] {
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            tx.execute_batch(&format!("DROP TRIGGER webdav_{kind}_{event};"))?;
+        }
+    }
+    for r in &mut local {
+        convert_legacy_folder(r, &paths);
+    }
+    tx.execute(
+        "DELETE FROM webdav_records WHERE kind IN ('folder','feed')",
+        [],
+    )?;
+    for r in &local {
+        tx.execute(
+            "INSERT INTO webdav_records VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                r.kind,
+                r.key,
+                r.clock,
+                r.nonce,
+                r.deleted,
+                r.data.to_string()
+            ],
+        )?;
+    }
+    for table in ["webdav_baseline", "webdav_observed"] {
+        let mut history = Vec::new();
+        visit(
+            &tx,
+            &format!("SELECT record FROM {table} WHERE kind IN ('folder','feed')"),
+            |r| {
+                history.push(r);
+                Ok(())
+            },
+        )?;
+        let mut mapping = paths.clone();
+        mapping.extend(legacy_folder_paths(&history)?);
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE kind IN ('folder','feed')"),
+            [],
+        )?;
+        for mut r in history {
+            convert_legacy_folder(&mut r, &mapping);
+            tx.execute(
+                &format!("INSERT INTO {table} VALUES(?1,?2,?3)"),
+                params![
+                    r.kind,
+                    r.key,
+                    serde_json::to_string(&r).map_err(|_| invalid())?
+                ],
+            )?;
+        }
+    }
+    let conflicts = conflicts(&tx)?;
+    for c in conflicts
+        .into_iter()
+        .filter(|c| ["folder", "feed"].contains(&c.kind.as_str()))
+    {
+        let mut l = c.local;
+        let mut r = c.remote;
+        convert_legacy_folder(&mut l, &paths);
+        convert_legacy_folder(&mut r, &paths);
+        if r.kind == "folder" {
+            let mut names = r.data["parent_id"]
+                .as_str()
+                .map(|s| serde_json::from_str::<Vec<String>>(s))
+                .transpose()
+                .map_err(|_| invalid())?
+                .unwrap_or_default();
+            names.push(
+                r.data["name"]
+                    .as_str()
+                    .ok_or_else(invalid)?
+                    .to_ascii_lowercase(),
+            );
+            r.key = serde_json::to_string(&names).map_err(|_| invalid())?;
+        }
+        tx.execute(
+            "DELETE FROM webdav_conflicts WHERE kind=?1 AND key=?2",
+            params![c.kind, c.key],
+        )?;
+        store_conflict(&tx, &l, &r, &c.reason)?;
+    }
+    // A parent moved before upgrading can change descendants' natural keys
+    // without changing their old basename-based revisions. Preserve that edit.
+    let mut base = Vec::new();
+    visit(
+        &tx,
+        "SELECT record FROM webdav_baseline WHERE kind IN ('folder','feed')",
+        |r| {
+            base.push(r);
+            Ok(())
+        },
+    )?;
+    for r in &local {
+        if let Some(old) = base.iter().find(|b| {
+            b.kind == r.kind
+                && (b.key == r.key || (r.kind == "folder" && b.data["name"] == r.data["name"]))
+        }) {
+            if !same_value(r, old) || r.key != old.key {
+                tx.execute("UPDATE webdav_control SET clock=clock+1 WHERE id=1", [])?;
+                let clock: i64 =
+                    tx.query_row("SELECT clock FROM webdav_control", [], |r| r.get(0))?;
+                tx.execute("UPDATE webdav_records SET clock=?3,nonce=lower(hex(randomblob(16))) WHERE kind=?1 AND key=?2",params![r.kind,r.key,clock])?;
+                if r.kind == "folder" && r.key != old.key {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO webdav_records VALUES(?1,?2,?3,?4,1,?5)",
+                        params![
+                            old.kind,
+                            old.key,
+                            clock,
+                            probe_id(&tx)?,
+                            old.data.to_string()
+                        ],
+                    )?;
+                }
+            }
+        }
+    }
+    tx.execute(
+        "DELETE FROM webdav_incoming WHERE kind IN ('folder','feed')",
+        [],
+    )?;
+    tx.execute("DELETE FROM webdav_incoming_chunks WHERE CASE WHEN json_valid(descriptor) THEN json_extract(descriptor,'$.kind') END IN ('folder','feed')",[])?;
+    tx.execute(
+        "DELETE FROM webdav_buckets WHERE kind IN ('folder','feed')",
+        [],
+    )?;
+    tx.execute_batch(&tracking_sql(
+        current_specs()
+            .into_iter()
+            .filter(|s| ["folder", "feed"].contains(&s.kind))
+            .collect(),
+        true,
+    ))?;
+    for event in ["UPDATE", "DELETE"] {
+        let action = if event == "UPDATE" {
+            "UPDATE OF name,parent_id"
+        } else {
+            "DELETE"
+        };
+        tx.execute_batch(&format!("CREATE TRIGGER webdav_folder_tree_{event} AFTER {action} ON folders WHEN (SELECT paused FROM webdav_control WHERE id=1)=0 BEGIN {} END;",repair_folder_sql()))?;
+    }
+    tx.execute("DELETE FROM webdav_folder_scope_upgrade", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn feed_retention_schema() -> &'static str {
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        let mut sql=String::from("ALTER TABLE feeds ADD COLUMN max_articles INTEGER CHECK(max_articles IS NULL OR max_articles=100); UPDATE webdav_records SET data=json_set(data,'$.max_articles',NULL) WHERE kind='feed';");
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            sql.push_str(&format!("DROP TRIGGER webdav_feed_{event};"));
+        }
+        sql.push_str(&tracking_sql(
+            current_specs()
+                .into_iter()
+                .filter(|s| s.kind == "feed")
+                .collect(),
+            true,
+        ));
+        sql
+    });
+    SQL.as_str()
 }
 
 /// v26: two logical preference records. Provider/model/effort travel together;
@@ -515,7 +823,7 @@ fn tracking_sql(tracking_specs: Vec<Spec>, modern: bool) -> String {
             // Renaming a natural parent key also changes the references
             // encoded in its children, even though their local IDs stay put.
             if event == "UPDATE" && ["folder", "tag"].contains(&spec.kind) {
-                if spec.kind == "folder" {
+                if spec.kind == "folder" && spec.key == "lower(t.name)" {
                     sql.push_str(&format!("UPDATE webdav_records SET data=json_set(data,'$.folder_id',lower(new.name)),clock={clock},nonce={nonce} WHERE kind='feed' AND deleted=0 AND json_extract(data,'$.folder_id')=lower(old.name);"));
                     if spec.columns.iter().any(|(c, _)| *c == "parent_id") {
                         sql.push_str(&format!("UPDATE webdav_records SET data=json_set(data,'$.parent_id',lower(new.name)),clock={clock},nonce={nonce} WHERE kind='folder' AND deleted=0 AND json_extract(data,'$.parent_id')=lower(old.name);"));
@@ -626,7 +934,7 @@ fn invalid() -> AppError {
 fn reference(kind: &str, column: &str, value: &str) -> String {
     let (table, key) = match column {
         "parent_id" if kind == "tag" => ("tags", tag_key("t")),
-        "parent_id" | "folder_id" => ("folders", "lower(t.name)".to_string()),
+        "parent_id" | "folder_id" => ("folders", folder_key("t")),
         "feed_id" => ("feeds", "t.feed_url".to_string()),
         "tag_id" => ("tags", tag_key("t")),
         "article_id" => (
@@ -705,6 +1013,9 @@ fn validate(record: &Record, spec: &Spec) -> AppResult<()> {
         }
     }
     if spec.kind == "feed" {
+        if !(object["max_articles"].is_null() || object["max_articles"].as_i64() == Some(100)) {
+            return Err(invalid());
+        }
         let url = object["feed_url"].as_str().ok_or_else(invalid)?;
         if !url::Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
             || object["source_type"] == "newsletter"
@@ -806,7 +1117,48 @@ fn merge_rows(conn: &Connection, incoming: &[Record]) -> AppResult<usize> {
     merge_table(conn, "webdav_input")
 }
 
+/// A cleanup on another device must not discard a local collection or annotation.
+/// Protection wins automatically; unrelated concurrent edits still use review.
+fn preserve_protected_articles(conn: &Connection, table: &str) -> AppResult<()> {
+    let sql=format!("SELECT r.record FROM {table} r JOIN feeds f ON f.feed_url=json_extract(r.key,'$[0]') JOIN articles a ON a.feed_id=f.id AND a.guid=json_extract(r.key,'$[1]') LEFT JOIN webdav_records l ON l.kind='retention' AND l.key=r.key WHERE r.kind='retention' AND json_extract(r.record,'$.deleted')=0 AND (l.key IS NULL OR json_extract(r.record,'$.clock')>l.clock OR (json_extract(r.record,'$.clock')=l.clock AND json_extract(r.record,'$.nonce')>l.nonce)) AND (a.is_starred=1 OR a.read_later=1 OR EXISTS(SELECT 1 FROM highlights h WHERE h.article_id=a.id))");
+    let mut protected = Vec::new();
+    visit(conn, &sql, |r| {
+        protected.push(r);
+        Ok(())
+    })?;
+    if protected.is_empty() {
+        return Ok(());
+    }
+    let max_sql = if table == "webdav_incoming" {
+        format!("SELECT coalesce(max(clock),0) FROM {table}")
+    } else {
+        format!("SELECT coalesce(max(json_extract(record,'$.clock')),0) FROM {table}")
+    };
+    let remote_clock: i64 = conn.query_row(&max_sql, [], |r| r.get(0))?;
+    conn.execute(
+        "UPDATE webdav_control SET clock=max(clock,?1)+1 WHERE id=1",
+        [remote_clock],
+    )?;
+    let clock: i64 = conn.query_row("SELECT clock FROM webdav_control WHERE id=1", [], |r| {
+        r.get(0)
+    })?;
+    for mut marker in protected {
+        marker.deleted = true;
+        marker.clock = clock;
+        marker.nonce = probe_id(conn)?;
+        conn.execute("DELETE FROM article_tombstones WHERE feed_id=(SELECT id FROM feeds WHERE feed_url=json_extract(?1,'$[0]')) AND guid=json_extract(?1,'$[1]')",[&marker.key])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO webdav_records VALUES('retention',?1,?2,?3,1,?4)",
+            params![marker.key, clock, marker.nonce, marker.data.to_string()],
+        )?;
+        conn.execute("UPDATE webdav_records SET clock=?2,nonce=?3 WHERE key=?1 AND kind IN ('article','is_read','is_starred','read_later','reading_progress') AND deleted=0",params![marker.key,clock,marker.nonce])?;
+        conn.execute("UPDATE webdav_records SET clock=?2,nonce=?3 WHERE kind IN ('highlight','article_tag','enclosure') AND json_extract(data,'$.article_id')=?1 AND deleted=0",params![marker.key,clock,marker.nonce])?;
+    }
+    Ok(())
+}
+
 fn merge_table(conn: &Connection, table: &str) -> AppResult<usize> {
+    preserve_protected_articles(conn, table)?;
     let specs = current_specs();
     conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS webdav_changed(kind TEXT,key TEXT,PRIMARY KEY(kind,key)); DELETE FROM webdav_changed;")?;
     let mut changed = 0;
@@ -863,17 +1215,10 @@ fn merge_table(conn: &Connection, table: &str) -> AppResult<usize> {
         [],
         |r| r.get(0),
     )?;
-    let folder_spec = specs.iter().find(|s| s.kind == "folder").unwrap();
-    visit(
-        conn,
-        &format!("SELECT {RECORD_JSON} FROM webdav_records WHERE kind='folder' AND deleted=0"),
-        |mut r| {
-            r.data["parent_id"] = Value::Null;
-            apply(conn, folder_spec, &r)
-        },
-    )?;
+    // Remove canceled purge markers before restoring the corresponding bodies.
+    conn.execute("DELETE FROM article_tombstones AS t WHERE json_array((SELECT feed_url FROM feeds WHERE id=t.feed_id),t.guid) IN (SELECT key FROM webdav_records WHERE kind='retention' AND deleted=1)",[])?;
     for spec in &specs {
-        let order = if spec.kind == "tag" {
+        let order = if ["tag", "folder"].contains(&spec.kind) {
             "json_array_length(key),key"
         } else {
             "key"
@@ -887,7 +1232,7 @@ fn merge_table(conn: &Connection, table: &str) -> AppResult<usize> {
         visit(conn,&format!("SELECT {RECORD_JSON} FROM webdav_records WHERE kind='{}' AND deleted=0{filter} ORDER BY {order}",spec.kind),|r|apply(conn,spec,&r))?;
     }
     for spec in specs.iter().rev().filter(|s| !s.state) {
-        let order = if spec.kind == "tag" {
+        let order = if ["tag", "folder"].contains(&spec.kind) {
             "json_array_length(key) DESC,key"
         } else {
             "key"
@@ -919,6 +1264,7 @@ fn merge_table(conn: &Connection, table: &str) -> AppResult<usize> {
         }
     }
     conn.execute_batch(&repair_tag_sql())?;
+    conn.execute_batch(&repair_folder_sql())?;
     conn.execute("UPDATE webdav_control SET paused=0 WHERE id=1", [])?;
     Ok(changed)
 }
@@ -975,7 +1321,9 @@ fn apply(conn: &Connection, spec: &Spec, record: &Record) -> AppResult<()> {
     // for later reconciliation, without resurrecting its deleted parent.
     for ((col, _), expr) in spec.columns.iter().zip(&expressions) {
         if (["feed_id", "article_id", "tag_id"].contains(col)
-            || (spec.kind == "tag" && *col == "parent_id" && !data[*col].is_null()))
+            || (["tag", "folder"].contains(&spec.kind)
+                && *col == "parent_id"
+                && !data[*col].is_null()))
             && !(spec.kind == "rule" && *col == "feed_id" && data[*col].is_null())
         {
             let exists: bool = conn.query_row(
@@ -1090,7 +1438,7 @@ pub fn conflicts(conn: &Connection) -> AppResult<Vec<Conflict>> {
     let mut out = Vec::new();
     for row in rows {
         let (kind, key, l, r, reason) = row?;
-        let title = if kind == "tag" {
+        let title = if ["tag", "folder"].contains(&kind.as_str()) {
             serde_json::from_str::<Vec<String>>(&key)
                 .map(|p| p.join(" / "))
                 .unwrap_or_else(|_| key.clone())
@@ -1121,6 +1469,11 @@ fn same_revision(a: &Record, b: &Record) -> bool {
     a.clock == b.clock && a.nonce == b.nonce && same_value(a, b)
 }
 fn normalized(mut r: Record) -> Record {
+    if r.kind == "feed" {
+        if let Some(o) = r.data.as_object_mut() {
+            o.entry("max_articles").or_insert(Value::Null);
+        }
+    }
     if ["tag", "folder"].contains(&r.kind.as_str()) {
         if let Some(o) = r.data.as_object_mut() {
             o.entry("parent_id").or_insert(Value::Null);
@@ -1202,7 +1555,12 @@ fn detect_table(conn: &Connection, table: &str) -> AppResult<usize> {
             let base=normalized(serde_json::from_str(&base).map_err(|_|invalid())?);
             !same_revision(&l,&base)&&!same_revision(&r,&base)
         } else {l.clock>0&&r.clock>0&&!l.nonce.is_empty()&&!r.nonce.is_empty()};
-        if both_changed { store_conflict(conn,&l,&r,"concurrent")?; }
+        // A protected article restored after cleanup carries its original user
+        // state. Its canceled purge marker makes this a coherent restoration.
+        let restored = if l.deleted && !r.deleted && ["is_read","is_starred","read_later","reading_progress"].contains(&r.kind.as_str()) {
+            conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} p JOIN {table} a ON a.key=p.key AND a.kind='article' WHERE p.kind='retention' AND p.key=?1 AND json_extract(p.record,'$.deleted')=1 AND json_extract(a.record,'$.deleted')=0)"),[&r.key],|row|row.get::<_,bool>(0))?
+        } else {false};
+        if both_changed && !restored { store_conflict(conn,&l,&r,"concurrent")?; }
         Ok(())
     })?;
     // Only hierarchy metadata needs a combined graph in memory.
@@ -1341,7 +1699,7 @@ pub fn resolve_conflict(
     };
     chosen.clock=tx.query_row("SELECT max(clock+1,?1+1,?2+1,CAST(unixepoch('subsec')*1000 AS INTEGER)) FROM webdav_control WHERE id=1",params![c.local.clock,c.remote.clock],|r|r.get(0))?;
     let mut removed_path = None;
-    if kind == "tag" && chosen.data["parent_id"].is_null() {
+    if ["tag", "folder"].contains(&kind) && chosen.data["parent_id"].is_null() {
         let root_key = serde_json::json!([chosen.data["name"]
             .as_str()
             .ok_or_else(invalid)?
@@ -1358,6 +1716,13 @@ pub fn resolve_conflict(
     // If hierarchy validation fails, the choice
     // rolls back and the conflict remains available for another resolution.
     let mut changes = vec![chosen];
+    if changes[0].key != c.local.key && removed_path.as_ref().is_none_or(|r| r.key != c.local.key) {
+        let mut old = c.local.clone();
+        old.deleted = true;
+        old.clock = changes[0].clock;
+        old.nonce = changes[0].nonce.clone();
+        changes.push(old);
+    }
     if let Some(old) = removed_path {
         changes.push(old);
     }

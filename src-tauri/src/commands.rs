@@ -221,6 +221,7 @@ pub async fn add_feed(
         refresh_interval_min: None,
         auto_translate: false,
         open_mode: None,
+        max_articles: None,
     })
 }
 
@@ -694,8 +695,7 @@ pub async fn import_opml(app: AppHandle, content: String) -> AppResult<usize> {
 #[tauri::command]
 pub async fn export_opml(state: State<'_, AppState>) -> AppResult<String> {
     let conn = state.read().await;
-    let feeds = db::feeds_for_export(&conn)?;
-    opml::build_with_folders(&feeds, &db::list_folders(&conn)?)
+    db::export_opml(&conn)
 }
 
 // ─────────────────────────── file read / write ───────────────────────────
@@ -1750,6 +1750,7 @@ pub async fn add_newsletter_source(
         refresh_interval_min: None,
         auto_translate: false,
         open_mode: None,
+        max_articles: None,
     })
 }
 
@@ -1940,3 +1941,13 @@ mod tests {
         assert_eq!(got, vec![None, Some("https://ex.com/".to_string())]);
     }
 }
+
+#[tauri::command]
+pub async fn preview_feed_cleanup(state:State<'_,AppState>,id:i64)->AppResult<db::FeedCleanupPlan> {db::preview_feed_cleanup(&*state.read().await,id)}
+#[tauri::command]
+pub async fn cleanup_feed_articles(app:AppHandle,state:State<'_,AppState>,id:i64,token:String,automatic:bool)->AppResult<usize> {
+    let n=db::cleanup_feed_articles(&*state.db.lock().await,id,&token,automatic)?;
+    let _=app.emit("articles-changed",());Ok(n)
+}
+#[tauri::command]
+pub async fn disable_feed_limit(state:State<'_,AppState>,id:i64)->AppResult<()> {db::disable_feed_limit(&*state.db.lock().await,id)}

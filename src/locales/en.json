@@ -169,6 +169,8 @@
     "footerHint": "Articles · Feeds · Commands"
   },
   "reader": {
+    "playYoutube": "Play in Papr",
+    "openYoutube": "Open in YouTube",
     "resizeAi": "Resize AI summary panel",
     "fullTextExtracted": "Full text extracted",
     "linkCopied": "Link copied",
@@ -342,6 +344,16 @@
       "defaultOpenModeDesc": "How articles open by default — individual feeds can override this in Subscriptions"
     },
     "subscriptions": {
+      "cleanup100": "Keep latest 100: clean up older articles",
+      "cleanupDone": "Deleted {{count}} older articles",
+      "cleanupPreview": "Delete {{count}} older articles from “{{feed}}”, keeping {{remaining}}. Starred, read-later and annotated articles are protected. Deletions sync to other devices and cannot be undone.",
+      "cleanupAutomatic": "Enable automatic cleanup after each refresh.",
+      "cleanupConfirm": "Confirm cleanup",
+      "keepAll": "Keep all",
+      "keep100": "Auto keep latest 100",
+      "keepLimit": "Article retention limit",
+      "keepHint": "Starred, read-later and annotated articles are kept in addition to the latest 100, so the total can exceed 100. Freed pages are reused; compact the database in Advanced to shrink the file.",
+
       "searchPlaceholder": "Search feeds…",
       "importOpml": "Import OPML",
       "export": "Export",
@@ -623,6 +635,8 @@
     }
   },
   "sidebar": {
+    "copyFeedUrl": "Copy feed URL",
+    "feedUrlCopied": "Feed URL copied",
     "searchArticles": "Search articles",
     "library": "Library",
     "feeds": "Feeds",
@@ -695,7 +709,7 @@
     "emptyFeedTitle": "Feed name can't be empty",
     "emptyFolderName": "Folder name can't be empty",
     "tagNameExists": "A tag with this name already exists under the same parent.",
-    "folderNameExists": "A folder with that name already exists",
+    "folderNameExists": "A folder with that name already exists under this parent",
     "emptyRuleQuery": "Enter at least one keyword for the rule",
     "noFeedFound": "No feed found at that URL",
     "responseTooLarge": "The server's response was too large",
@@ -719,6 +733,7 @@
     "noInstapaperConfig": "Add your Instapaper username and password in Settings → Integrations",
     "noKindleConfig": "Configure your Kindle address and SMTP server in Settings → Integrations",
     "webdavInvalidUrl": "Enter an HTTP(S) directory URL without embedded credentials, query parameters or a fragment.",
+    "feedCleanupChanged": "Articles changed. Review a fresh cleanup preview before confirming.",
     "webdavAuthFailed": "WebDAV authentication failed. Check the username and password.",
     "webdavEtagRequired": "This WebDAV server does not provide strong ETags. Safe multi-device sync is unavailable.",
     "webdavTooLarge": "A single sync record exceeds 64 MiB, or the manifest is too large. There is no 128 MiB limit on the whole library.",

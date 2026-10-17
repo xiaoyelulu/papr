@@ -6,6 +6,8 @@ import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import * as api from "../api";
+import { copyText } from "../lib/clipboard";
+import ContextMenu from "./ContextMenu";
 import { useUi, READER_BOUNDS, SIDEBAR_FONT_BOUNDS, type OpenMode } from "../store";
 import { useArticleActions } from "../hooks/articleActions";
 import { useFocusTrap } from "../hooks/useFocusTrap";
@@ -797,6 +799,19 @@ function SubscriptionsSection({
   const qc = useQueryClient();
   const actions = useArticleActions();
   const [search, setSearch] = useState("");
+  const [cleanup, setCleanup] = useState<{ feed: Feed; plan: api.FeedCleanupPlan; automatic: boolean } | null>(null);
+  const [cleaning, setCleaning] = useState(false);
+  const requestCleanup = async (feed: Feed, automatic: boolean) => {
+    try { setCleanup({ feed, plan: await api.previewFeedCleanup(feed.id), automatic }); } catch (e) { reportError(e); }
+  };
+  const confirmCleanup = async () => {
+    if (!cleanup || cleaning) return;
+    setCleaning(true);
+    try { const n = await api.cleanupFeedArticles(cleanup.feed.id, cleanup.plan.token, cleanup.automatic); actions.refreshAfterBulk(); onToast(t("settings.subscriptions.cleanupDone", { count: n })); }
+    catch (e) { reportError(e); } finally { setCleaning(false); }
+  };
+  const [linkMenu, setLinkMenu] = useState<{ x: number; y: number; feed: Feed } | null>(null);
+  const copyFeedUrl = (feed: Feed) => { copyText(feed.feedUrl).then(() => onToast(t("sidebar.feedUrlCopied"))).catch(reportError); };
   const fileRef = useRef<HTMLInputElement>(null);
   const filtered = feeds.filter(
     (f) => !search || f.title.toLowerCase().includes(search.toLowerCase()),
@@ -885,6 +900,8 @@ function SubscriptionsSection({
 
   return (
     <>
+      {cleanup && <ConfirmDialog title={t("settings.subscriptions.cleanup100")} message={t("settings.subscriptions.cleanupPreview", { feed: cleanup.feed.title, count: cleanup.plan.remove, remaining: cleanup.plan.total - cleanup.plan.remove }) + (cleanup.automatic ? " " + t("settings.subscriptions.cleanupAutomatic") : "")} confirmLabel={t("settings.subscriptions.cleanupConfirm")} onConfirm={() => { void confirmCleanup(); }} onClose={() => setCleanup(null)} />}
+      {linkMenu && <ContextMenu x={linkMenu.x} y={linkMenu.y} onClose={() => setLinkMenu(null)} items={[{ icon: "copy", label: t("sidebar.copyFeedUrl"), description: linkMenu.feed.feedUrl, onClick: () => copyFeedUrl(linkMenu.feed) }, { separator: true }, { icon: "trash", label: t("settings.subscriptions.cleanup100"), onClick: () => { void requestCleanup(linkMenu.feed, false); } }]} />}
       <input
         ref={fileRef}
         type="file"
@@ -897,10 +914,11 @@ function SubscriptionsSection({
         }}
       />
       <div className="settings-group" style={{ marginBottom: 18 }}>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <div
             style={{
-              flex: 1,
+              flex: "1 1 180px",
+              minWidth: 0,
               display: "flex",
               alignItems: "center",
               gap: 8,
@@ -918,6 +936,7 @@ function SubscriptionsSection({
               {...NO_AUTOCORRECT}
               style={{
                 flex: 1,
+                minWidth: 0,
                 border: 0,
                 outline: 0,
                 background: "transparent",
@@ -943,9 +962,10 @@ function SubscriptionsSection({
         <h3 className="settings-group-title">
           {t("settings.subscriptions.feedsCount", { count: filtered.length })}
         </h3>
+        <p className="settings-hint">{t("settings.subscriptions.keepHint")}</p>
         <div>
           {filtered.map((f) => (
-            <div key={f.id} className="s-feed-row">
+            <div key={f.id} className="s-feed-row" onContextMenu={(e) => { if (f.sourceType === "newsletter") return; e.preventDefault(); setLinkMenu({ x: e.clientX, y: e.clientY, feed: f }); }}>
               <FeedAvatar
                 title={f.title}
                 faviconUrl={f.faviconUrl}
@@ -953,8 +973,9 @@ function SubscriptionsSection({
                 style={{ width: 22, height: 22, borderRadius: 5 }}
               />
               <span className="name">{f.title}</span>
-              <span className="url">{feedHost(f)}</span>
+              <span className="url" title={f.sourceType === "newsletter" ? undefined : f.feedUrl}>{feedHost(f)}</span>
               <div className="actions">
+                {f.sourceType !== "newsletter" && <button className="icon-btn" title={`${t("sidebar.copyFeedUrl")}\n${f.feedUrl}`} aria-label={t("sidebar.copyFeedUrl")} onClick={() => copyFeedUrl(f)}><Icon name="copy" size={14} /></button>}
                 <label
                   className="s-feed-autotr"
                   title={t("settings.subscriptions.autoTranslateDesc")}
@@ -978,6 +999,11 @@ function SubscriptionsSection({
                   onChange={(v) => updateInterval(f, v)}
                   aria-label={t("settings.subscriptions.refreshInterval")}
                 />
+                <Select disabled={cleaning} value={f.maxArticles === 100 ? "100" : "all"} options={[{ value: "all", label: t("settings.subscriptions.keepAll") }, { value: "100", label: t("settings.subscriptions.keep100") }]} aria-label={t("settings.subscriptions.keepLimit")} onChange={(v) => {
+                  if (v === "100") { void requestCleanup(f, true); }
+                  else api.disableFeedLimit(f.id).then(() => actions.refreshAfterBulk()).catch(reportError);
+                }} />
+                <button className="icon-btn" disabled={cleaning} title={t("settings.subscriptions.cleanup100")} aria-label={t("settings.subscriptions.cleanup100")} onClick={() => { void requestCleanup(f, false); }}><Icon name="list" size={14} /></button>
                 <button
                   className="icon-btn"
                   title={t("settings.subscriptions.unsubscribe")}

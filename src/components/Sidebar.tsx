@@ -2,6 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import * as api from "../api";
+import { copyText } from "../lib/clipboard";
 import { useUi } from "../store";
 import { useArticleActions } from "../hooks/articleActions";
 import { withUndo, reportError } from "../toast";
@@ -288,6 +289,8 @@ export default function Sidebar({
           guard(api.moveFeed(f.id, null), t("sidebar.toastMovedOut")),
       });
     return [
+      ...(f.sourceType !== "newsletter" ? [{ icon: "copy" as const, label: t("sidebar.copyFeedUrl"), description: f.feedUrl,
+        onClick: () => { copyText(f.feedUrl).then(() => onToast(t("sidebar.feedUrlCopied"))).catch(reportError); } }, { separator: true } as MenuEntry] : []),
       {
         icon: "check-all",
         label: t("sidebar.markAllRead"),

@@ -315,6 +315,8 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
         M::up(webdav::scoped_tag_schema()),
         M::up(webdav::ai_preferences_schema()),
         M::up(crate::webdav::chunk_schema()),
+        M::up("CREATE TABLE webdav_folder_scope_upgrade(id INTEGER PRIMARY KEY); INSERT INTO webdav_folder_scope_upgrade VALUES(1);"),
+        M::up(webdav::feed_retention_schema()),
     ])
 });
 
@@ -354,6 +356,7 @@ pub fn open(path: &Path) -> AppResult<Connection> {
     conn.pragma_update(None, "busy_timeout", 5000)?;
     MIGRATIONS.to_latest(&mut conn)?;
     register_functions(&conn)?;
+    webdav::upgrade_folder_scope(&mut conn)?;
     upgrade_legacy_folder_paths(&mut conn)?;
     Ok(conn)
 }
@@ -362,10 +365,10 @@ pub fn open(path: &Path) -> AppResult<Connection> {
 /// Preserve the original leaf ID whenever possible; every path is a savepoint
 /// so ambiguous names remain intact instead of stealing another folder's feeds.
 fn upgrade_legacy_folder_paths(conn: &mut Connection) -> AppResult<()> {
-    if get_setting(conn,"folder_path_upgrade_v1")?.as_deref()==Some("done") { return Ok(()); }
+    if get_setting(conn,"folder_path_upgrade_v2")?.as_deref()==Some("done") { return Ok(()); }
     let mut tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let folders:Vec<(i64,String)>={
-        let mut stmt=tx.prepare("SELECT id,name FROM folders WHERE parent_id IS NULL AND instr(name,'/')>0 ORDER BY length(name)-length(replace(name,'/','')),position,id")?;
+        let mut stmt=tx.prepare("SELECT id,name FROM folders WHERE instr(name,'/')>0 ORDER BY length(name)-length(replace(name,'/','')),position,id")?;
         let rows=stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?;
         rows.collect::<Result<_,_>>()?
     };
@@ -374,7 +377,7 @@ fn upgrade_legacy_folder_paths(conn: &mut Connection) -> AppResult<()> {
         if parts.len()>32 || parts.iter().any(|p|p.is_empty()) {continue;}
         let sp=tx.savepoint()?;
         let result=(||->AppResult<()> {
-            let mut parent=None;
+            let mut parent:Option<i64>=sp.query_row("SELECT parent_id FROM folders WHERE id=?1",[id],|r|r.get(0))?;
             for part in &parts[..parts.len()-1] {
                 let next=create_folder_in(&sp,part,parent)?;
                 let actual:Option<i64>=sp.query_row("SELECT parent_id FROM folders WHERE id=?1",[next],|r|r.get(0))?;
@@ -382,15 +385,12 @@ fn upgrade_legacy_folder_paths(conn: &mut Connection) -> AppResult<()> {
                 parent=Some(next);
             }
             let leaf=parts.last().unwrap();
-            let existing:Option<(i64,Option<i64>)>=sp.query_row("SELECT id,parent_id FROM folders WHERE name=?1 COLLATE NOCASE AND id!=?2",params![leaf,id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let existing:Option<(i64,Option<i64>)>=sp.query_row("SELECT id,parent_id FROM folders WHERE name=?1 COLLATE NOCASE AND id!=?2 AND parent_id IS ?3",params![leaf,id,parent],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             if let Some((target,target_parent))=existing {
                 if target_parent!=parent {return Err(AppError::code("folderNameExists"));}
-                sp.execute("UPDATE feeds SET folder_id=?2 WHERE folder_id=?1",params![id,target])?;
-                sp.execute("UPDATE folders SET parent_id=?2 WHERE parent_id=?1",params![id,target])?;
-                sp.execute("DELETE FROM folders WHERE id=?1",[id])?;
+                merge_folder_rows(&sp,id,target)?;
             } else {
-                rename_folder(&sp,id,leaf)?;
-                sp.execute("UPDATE folders SET parent_id=?2 WHERE id=?1",params![id,parent])?;
+                sp.execute("UPDATE folders SET name=?2,parent_id=?3 WHERE id=?1",params![id,leaf,parent])?;
             }
             Ok(())
         })();
@@ -400,7 +400,7 @@ fn upgrade_legacy_folder_paths(conn: &mut Connection) -> AppResult<()> {
             Err(error)=>return Err(error),
         }
     }
-    set_setting(&tx,"folder_path_upgrade_v1","done")?;
+    set_setting(&tx,"folder_path_upgrade_v2","done")?;
     tx.commit()?;
     Ok(())
 }
@@ -472,14 +472,12 @@ pub fn create_folder_in(conn: &Connection, name: &str, parent_id: Option<i64>) -
     }
     if let Some(id) = conn
         .query_row(
-            "SELECT id FROM folders WHERE name = ?1 COLLATE NOCASE",
-            params![name],
+            "SELECT id FROM folders WHERE name = ?1 COLLATE NOCASE AND parent_id IS ?2",
+            params![name,parent_id],
             |r| r.get::<_, i64>(0),
         )
         .optional()?
     {
-        let existing_parent: Option<i64> = conn.query_row("SELECT parent_id FROM folders WHERE id=?1", [id], |r| r.get(0))?;
-        if parent_id.is_some() && existing_parent != parent_id { return Err(AppError::code("folderNameExists")); }
         return Ok(id);
     }
     conn.execute(
@@ -511,7 +509,7 @@ pub fn rename_folder(conn: &Connection, id: i64, name: &str) -> AppResult<()> {
     }
     let clash: Option<i64> = conn
         .query_row(
-            "SELECT id FROM folders WHERE name = ?1 COLLATE NOCASE AND id != ?2",
+            "SELECT id FROM folders WHERE name = ?1 COLLATE NOCASE AND id != ?2 AND parent_id IS (SELECT parent_id FROM folders WHERE id=?2)",
             params![name, id],
             |r| r.get(0),
         )
@@ -535,14 +533,35 @@ pub fn move_folder(conn: &Connection, id: i64, parent_id: Option<i64>) -> AppRes
             params![id,parent], |r| r.get(0))?;
         if cycle { return Err(AppError::code("folderCycle")); }
     }
+    let clash:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM folders WHERE id!=?1 AND parent_id IS ?2 AND name=(SELECT name FROM folders WHERE id=?1) COLLATE NOCASE)",params![id,parent_id],|r|r.get(0))?;
+    if clash {return Err(AppError::code("folderNameExists"));}
     tx.execute("UPDATE folders SET parent_id=?2 WHERE id=?1", params![id,parent_id])?;
     tx.commit()?;
     Ok(())
 }
 
 pub fn delete_folder(conn: &Connection, id: i64) -> AppResult<()> {
-    conn.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
+    let tx=conn.unchecked_transaction()?;
+    let children:Vec<i64>={let mut s=tx.prepare("SELECT id FROM folders WHERE parent_id=?1")?;let r=s.query_map([id],|r|r.get(0))?;r.collect::<Result<_,_>>()?};
+    for child in children { promote_folder(&tx,child)?; }
+    tx.execute("DELETE FROM folders WHERE id=?1",[id])?;
+    tx.commit()?; Ok(())
+}
+fn promote_folder(conn:&Connection,id:i64)->AppResult<()> {
+    let target:Option<i64>=conn.query_row("SELECT id FROM folders WHERE parent_id IS NULL AND id!=?1 AND name=(SELECT name FROM folders WHERE id=?1) COLLATE NOCASE",[id],|r|r.get(0)).optional()?;
+    if let Some(target)=target { merge_folder_rows(conn,id,target)?; }
+    else {conn.execute("UPDATE folders SET parent_id=NULL WHERE id=?1",[id])?;}
     Ok(())
+}
+fn merge_folder_rows(conn:&Connection,source:i64,target:i64)->AppResult<()> {
+    conn.execute("UPDATE feeds SET folder_id=?2 WHERE folder_id=?1",params![source,target])?;
+    let children:Vec<i64>={let mut s=conn.prepare("SELECT id FROM folders WHERE parent_id=?1")?;let r=s.query_map([source],|r|r.get(0))?;r.collect::<Result<_,_>>()?};
+    for child in children {
+        let sibling:Option<i64>=conn.query_row("SELECT id FROM folders WHERE parent_id=?1 AND name=(SELECT name FROM folders WHERE id=?2) COLLATE NOCASE",params![target,child],|r|r.get(0)).optional()?;
+        if let Some(sibling)=sibling {merge_folder_rows(conn,child,sibling)?;}
+        else {conn.execute("UPDATE folders SET parent_id=?2 WHERE id=?1",params![child,target])?;}
+    }
+    conn.execute("DELETE FROM folders WHERE id=?1",[source])?; Ok(())
 }
 
 /// Delete a complete folder subtree and its subscriptions/articles atomically.
@@ -616,7 +635,7 @@ pub fn list_feeds(conn: &Connection) -> AppResult<Vec<Feed>> {
         "SELECT f.id, f.feed_url, f.site_url, f.title, f.description, f.favicon_url,
                 f.folder_id, f.source_type, f.last_fetched_at, f.fetch_error,
                 (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND a.is_read = 0),
-                f.refresh_interval_min, f.auto_translate, f.open_mode
+                f.refresh_interval_min, f.auto_translate, f.open_mode, f.max_articles
          FROM feeds f ORDER BY f.title COLLATE NOCASE",
     )?;
     let rows = stmt
@@ -636,6 +655,7 @@ pub fn list_feeds(conn: &Connection) -> AppResult<Vec<Feed>> {
                 refresh_interval_min: r.get(11)?,
                 auto_translate: r.get::<_, i64>(12)? != 0,
                 open_mode: r.get(13)?,
+                max_articles: r.get(14)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -859,6 +879,25 @@ pub fn feeds_for_export(conn: &Connection) -> AppResult<Vec<(String, String, Opt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Export folder identity as an actual path, so equal leaf labels never group
+/// subscriptions from different branches into the same OPML outline.
+pub fn export_opml(conn:&Connection)->AppResult<String> {
+    let folders=list_folders(conn)?;
+    let mut stmt=conn.prepare("SELECT title,feed_url,folder_id FROM feeds WHERE source_type!='newsletter' ORDER BY title,feed_url")?;
+    let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?)))?;
+    let mut feeds=Vec::new();
+    for row in rows {
+        let (title,url,mut parent)=row?;let mut path=Vec::new();let mut seen=std::collections::HashSet::new();
+        while let Some(id)=parent {
+            if !seen.insert(id) {return Err(AppError::code("folderCycle"));}
+            let Some(folder)=folders.iter().find(|f|f.id==id) else {break;};
+            path.push(folder.name.clone());parent=folder.parent_id;
+        }
+        path.reverse();feeds.push((title,url,path));
+    }
+    crate::opml::build_from_paths(&feeds)
 }
 
 /// Feed URLs the sync layer should mirror onto the server. Excludes
@@ -2475,6 +2514,42 @@ pub fn cleanup_old_articles(conn: &Connection, days: i64) -> AppResult<usize> {
     Ok(removed)
 }
 
+const FEED_PURGE: &str = "feed_id=?1 AND is_starred=0 AND read_later=0
+ AND NOT EXISTS(SELECT 1 FROM highlights h WHERE h.article_id=articles.id)
+ AND id NOT IN (SELECT id FROM articles WHERE feed_id=?1 ORDER BY coalesce(julianday(published_at),julianday(fetched_at)) DESC,guid DESC LIMIT 100)";
+#[derive(serde::Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct FeedCleanupPlan {pub total:usize,pub remove:usize,pub protected:usize,pub token:String}
+/// Preview contains counts and a hash of candidate identities, never bodies.
+pub fn preview_feed_cleanup(conn:&Connection,id:i64)->AppResult<FeedCleanupPlan> {
+    use sha2::{Digest,Sha256};
+    conn.query_row("SELECT id FROM feeds WHERE id=?1",[id],|r|r.get::<_,i64>(0))?;
+    let total=conn.query_row("SELECT count(*) FROM articles WHERE feed_id=?1",[id],|r|r.get(0))?;
+    let protected=conn.query_row("SELECT count(*) FROM articles a WHERE feed_id=?1 AND (is_starred=1 OR read_later=1 OR EXISTS(SELECT 1 FROM highlights h WHERE h.article_id=a.id))",[id],|r|r.get(0))?;
+    let mut hash=Sha256::new();hash.update(id.to_le_bytes());let mut remove=0;
+    let mut stmt=conn.prepare(&format!("SELECT id,guid FROM articles WHERE {FEED_PURGE} ORDER BY id"))?;let mut rows=stmt.query([id])?;
+    while let Some(r)=rows.next()? {let article:i64=r.get(0)?;let guid:String=r.get(1)?;hash.update(article.to_le_bytes());hash.update((guid.len() as u64).to_le_bytes());hash.update(guid.as_bytes());remove+=1;}
+    Ok(FeedCleanupPlan{total,remove,protected,token:format!("{:x}",hash.finalize())})
+}
+pub fn cleanup_feed_articles(conn:&Connection,id:i64,token:&str,automatic:bool)->AppResult<usize> {
+    let tx=conn.unchecked_transaction()?;
+    let current=preview_feed_cleanup(&tx,id)?;
+    if current.token!=token {return Err(AppError::code("feedCleanupChanged"));}
+    if automatic {tx.execute("UPDATE feeds SET max_articles=100 WHERE id=?1",[id])?;}
+    tx.execute(&format!("INSERT OR IGNORE INTO article_tombstones(feed_id,guid) SELECT feed_id,guid FROM articles WHERE {FEED_PURGE}"),[id])?;
+    let removed=tx.execute(&format!("DELETE FROM articles WHERE {FEED_PURGE}"),[id])?;
+    // Deletions remain syncable, without retaining the removed multi-MB body.
+    tx.execute("UPDATE webdav_control SET clock=clock+1 WHERE id=1",[])?;
+    tx.execute("UPDATE webdav_records SET data=json_set(data,'$.content_html',NULL,'$.extracted_html',NULL,'$.body_text',NULL,'$.summary',NULL),clock=(SELECT clock FROM webdav_control WHERE id=1),nonce=lower(hex(randomblob(16))) WHERE kind='article' AND deleted=1 AND json_extract(key,'$[0]')=(SELECT feed_url FROM feeds WHERE id=?1) AND (json_extract(data,'$.content_html') IS NOT NULL OR json_extract(data,'$.extracted_html') IS NOT NULL OR json_extract(data,'$.body_text') IS NOT NULL OR json_extract(data,'$.summary') IS NOT NULL)",[id])?;
+    tx.commit()?;Ok(removed)
+}
+pub fn disable_feed_limit(conn:&Connection,id:i64)->AppResult<()> {conn.execute("UPDATE feeds SET max_articles=NULL WHERE id=?1",[id])?;Ok(())}
+pub fn cleanup_limited_feeds(conn:&Connection)->AppResult<usize> {
+    let ids:Vec<i64>={let mut s=conn.prepare("SELECT id FROM feeds WHERE max_articles=100")?;let r=s.query_map([],|r|r.get(0))?;r.collect::<Result<_,_>>()?};
+    let mut removed=0;for id in ids {let plan=preview_feed_cleanup(conn,id)?;if plan.remove>0 {removed+=cleanup_feed_articles(conn,id,&plan.token,false)?;}}
+    Ok(removed)
+}
+
 /// Reclaim free pages — must run outside any transaction.
 pub fn vacuum(conn: &Connection) -> AppResult<()> {
     conn.execute_batch("VACUUM")?;
@@ -2707,7 +2782,7 @@ mod tests {
 
     #[test]
     fn folder_path_upgrade_preserves_ids_subscriptions_and_reading_state() {
-        let mut conn=Connection::open_in_memory().unwrap();MIGRATIONS.to_latest(&mut conn).unwrap();
+        let mut conn=Connection::open_in_memory().unwrap();MIGRATIONS.to_latest(&mut conn).unwrap();webdav::upgrade_folder_scope(&mut conn).unwrap();
         conn.execute("INSERT INTO folders(id,name) VALUES(10,'01 AI AGENT/公众号'),(11,'01 AI AGENT/订阅/技术')",[]).unwrap();
         conn.execute("INSERT INTO feeds(id,feed_url,title,folder_id) VALUES(1,'https://example.com/rss','Feed',10)",[]).unwrap();
         conn.execute("INSERT INTO articles(feed_id,guid,title,is_read,is_starred,read_later,reading_progress) VALUES(1,'one','Preserved article',1,1,1,0.7)",[]).unwrap();
@@ -2724,14 +2799,14 @@ mod tests {
 
     #[test]
     fn folder_path_upgrade_reuses_exact_path_and_keeps_ambiguous_paths() {
-        let mut conn=Connection::open_in_memory().unwrap();MIGRATIONS.to_latest(&mut conn).unwrap();
+        let mut conn=Connection::open_in_memory().unwrap();MIGRATIONS.to_latest(&mut conn).unwrap();webdav::upgrade_folder_scope(&mut conn).unwrap();
         conn.execute("INSERT INTO folders(id,name,parent_id) VALUES(1,'Root',NULL),(2,'Leaf',1),(3,'Root/Leaf',NULL),(4,'Other/Leaf',NULL),(5,'Invalid//Leaf',NULL)",[]).unwrap();
         conn.execute("INSERT INTO feeds(feed_url,title,folder_id) VALUES('https://example.com/rss','Feed',3)",[]).unwrap();
         upgrade_legacy_folder_paths(&mut conn).unwrap();
         assert_eq!(conn.query_row("SELECT folder_id FROM feeds",[],|r|r.get::<_,i64>(0)).unwrap(),2);
         assert_eq!(conn.query_row("SELECT count(*) FROM folders WHERE id=3",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(conn.query_row("SELECT name FROM folders WHERE id=4",[],|r|r.get::<_,String>(0)).unwrap(),"Other/Leaf");
-        assert_eq!(conn.query_row("SELECT count(*) FROM folders WHERE name='Other'",[],|r|r.get::<_,i64>(0)).unwrap(),0,"Failed path must roll back its newly created prefixes");
+        assert_eq!(conn.query_row("SELECT name FROM folders WHERE id=4",[],|r|r.get::<_,String>(0)).unwrap(),"Leaf");
+        assert_eq!(conn.query_row("SELECT count(*) FROM folders WHERE name='Other'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(conn.query_row("SELECT name FROM folders WHERE id=5",[],|r|r.get::<_,String>(0)).unwrap(),"Invalid//Leaf");
     }
 
@@ -2755,28 +2830,28 @@ mod tests {
     }
     #[test]
     fn startup_migrations_preserve_existing_databases() {
-        for version in [0, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28] {
+        for version in [0, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30] {
             let path = std::env::temp_dir().join(format!("papr-migrations-{}-{}-{}.db",
                 std::process::id(), version,
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             let mut conn = Connection::open(&path).unwrap();
-            MIGRATIONS.to_version(&mut conn, version.min(27)).unwrap();
+            MIGRATIONS.to_version(&mut conn, version.min(29)).unwrap();
             if version > 0 {
                 conn.execute("INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.com/rss','Preserved')", []).unwrap();
                 conn.execute("INSERT INTO articles(feed_id,guid,title,is_starred) VALUES(1,'one','Article',1)", []).unwrap();
             }
             if version >= 20 { conn.execute("UPDATE feeds SET custom_favicon=1", []).unwrap(); }
             if version >= 21 { conn.execute("UPDATE feeds SET position=42", []).unwrap(); }
-            if version == 28 { conn.pragma_update(None, "user_version", 28).unwrap(); }
+            if version == 30 { conn.pragma_update(None, "user_version", 30).unwrap(); }
             drop(conn);
             let result = open(&path);
-            if version == 28 {
+            if version == 30 {
                 assert!(result.is_err());
                 let conn = Connection::open(&path).unwrap();
-                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 28);
+                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 30);
             } else {
                 let conn = result.unwrap();
-                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 27);
+                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 29);
                 if version > 0 {
                     let values: (String,i64,i64) = conn.query_row("SELECT title,custom_favicon,position FROM feeds WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
                     assert_eq!(values, ("Preserved".into(), i64::from(version>=20), if version>=21 {42} else {0}));

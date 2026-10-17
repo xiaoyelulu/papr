@@ -68,6 +68,7 @@ pub struct Feed {
     /// (embedded web view of the original page). `None` follows the default
     /// behaviour (reader view, honouring the global auto-extract preference).
     pub open_mode: Option<String>,
+    pub max_articles: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

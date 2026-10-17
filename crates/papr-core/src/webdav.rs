@@ -175,7 +175,7 @@ async fn download(http: &Client, c: &Credentials) -> AppResult<(Root, Option<Str
     }
     let version: Version =
         serde_json::from_slice(&body).map_err(|_| AppError::code("webdavInvalidData"))?;
-    let root = if version.version == 6 {
+    let root = if matches!(version.version, 6 | 7) {
         if body.len() > 16 * 1024 * 1024 {
             return Err(AppError::code("webdavTooLarge"));
         }
@@ -189,6 +189,7 @@ async fn download(http: &Client, c: &Credentials) -> AppResult<(Root, Option<Str
         if snapshot.version < 4 {
             replication::upgrade_legacy_tags(&mut snapshot.records)?;
         }
+        replication::upgrade_legacy_folders(&mut snapshot.records)?;
         Root::Legacy(snapshot)
     } else {
         return Err(AppError::code("webdavVersion"));
@@ -713,7 +714,7 @@ mod tests {
         assert!(!body.contains("SECRET"));
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body).unwrap()["version"],
-            6
+            7
         );
         task.abort();
     }
@@ -839,7 +840,7 @@ mod tests {
         sync_now(&a, &http).await.unwrap();
         let old: chunks::Manifest =
             serde_json::from_slice(server.lock().unwrap().body.as_ref().unwrap()).unwrap();
-        assert_eq!(old.version, 6);
+        assert_eq!(old.version, 7);
         connect(&b, &http, &url, "u", "p").await.unwrap();
         sync_now(&b, &http).await.unwrap();
         let (puts, gets) = {
@@ -1026,6 +1027,94 @@ mod tests {
         drop(b);
         task.abort();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[tokio::test]
+    async fn v6_folders_upgrade_to_scoped_paths_without_reuploading_articles() {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        let b = database();
+        seed(&a).await;
+        {
+            let c = a.lock().await;
+            let p = db::create_folder(&c, "Root").unwrap();
+            let q = db::create_folder_in(&c, "Child", Some(p)).unwrap();
+            db::move_feed(&c, 1, Some(q)).unwrap();
+        }
+        let mut old = replication::records(&*a.lock().await).unwrap();
+        for r in &mut old {
+            let basename = |key: &str| {
+                serde_json::from_str::<Vec<String>>(key)
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+            };
+            if r.kind == "folder" {
+                r.key = basename(&r.key);
+                if let Some(p) = r.data["parent_id"].as_str() {
+                    r.data["parent_id"] = serde_json::Value::String(basename(p));
+                }
+            }
+            if r.kind == "feed" {
+                if let Some(p) = r.data["folder_id"].as_str() {
+                    r.data["folder_id"] = serde_json::Value::String(basename(p));
+                }
+            }
+        }
+        let mut manifest = chunks::Manifest::empty();
+        manifest.version = 6;
+        let mut article_hash = String::new();
+        for r in old {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut raw = serde_json::to_vec(&r).unwrap();
+            raw.push(b'\n');
+            encoder.write_all(&raw).unwrap();
+            let body = encoder.finish().unwrap();
+            let part = chunks::Part {
+                hash: format!("{:x}", Sha256::digest(&body)),
+                kind: r.kind.clone(),
+                bucket: Sha256::digest(r.key.as_bytes())[0],
+                bytes: body.len(),
+                raw_bytes: raw.len(),
+                records: 1,
+            };
+            if r.kind == "article" {
+                article_hash = part.hash.clone();
+            }
+            server
+                .lock()
+                .unwrap()
+                .objects
+                .insert(format!("/papr/{}", chunks::path(&part)), body);
+            manifest.chunks.push(part);
+        }
+        {
+            let mut s = server.lock().unwrap();
+            s.body = Some(serde_json::to_vec(&manifest).unwrap());
+            s.revision = 1;
+        }
+        connect(&b, &http, &url, "u", "p").await.unwrap();
+        sync_now(&b, &http).await.unwrap();
+        let c = b.lock().await;
+        let parent:String=c.query_row("SELECT p.name FROM feeds f JOIN folders leaf ON leaf.id=f.folder_id JOIN folders p ON p.id=leaf.parent_id",[],|r|r.get(0)).unwrap();
+        assert_eq!(parent, "Root");
+        drop(c);
+        let current: chunks::Manifest =
+            serde_json::from_slice(server.lock().unwrap().body.as_ref().unwrap()).unwrap();
+        assert_eq!(current.version, 7);
+        assert_eq!(
+            current
+                .chunks
+                .iter()
+                .find(|p| p.kind == "article")
+                .unwrap()
+                .hash,
+            article_hash
+        );
+        task.abort();
     }
     #[test]
     fn validates_directory_urls() {

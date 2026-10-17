@@ -10,6 +10,7 @@ export type MenuEntry =
   | {
       icon?: IconName;
       label: string;
+      description?: string;
       shortcut?: string;
       danger?: boolean;
       onClick: () => void;
@@ -95,7 +96,7 @@ export default function ContextMenu({ x, y, items, onClose }: Props) {
             <span className="ctx-ico">
               {it.icon && <Icon name={it.icon} size={13} />}
             </span>
-            {it.label}
+            <span className="ctx-label">{it.label}{it.description && <span className="ctx-description">{it.description}</span>}</span>
             {it.shortcut && <span className="ctx-shortcut">{it.shortcut}</span>}
           </div>
         ),

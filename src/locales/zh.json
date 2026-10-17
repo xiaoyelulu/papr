@@ -169,6 +169,8 @@
     "footerHint": "支持文章 · 订阅源 · 命令"
   },
   "reader": {
+    "playYoutube": "在应用中播放",
+    "openYoutube": "在 YouTube 中打开",
     "resizeAi": "调整 AI 摘要面板宽度",
     "fullTextExtracted": "已提取全文",
     "linkCopied": "链接已复制",
@@ -342,6 +344,16 @@
       "defaultOpenModeDesc": "文章默认的打开方式，可在订阅源列表中按源覆盖"
     },
     "subscriptions": {
+      "cleanup100": "清理旧文章，仅保留最新 100 篇",
+      "cleanupDone": "已删除 {{count}} 篇旧文章",
+      "cleanupPreview": "订阅源“{{feed}}”将删除 {{count}} 篇旧文章，保留 {{remaining}} 篇。星标、稍后读及有高亮/笔记的文章不会删除。删除记录会同步到其他设备，此操作无法撤销。",
+      "cleanupAutomatic": "确认后开启自动保留：每次刷新后继续执行此规则。",
+      "cleanupConfirm": "确认清理",
+      "keepAll": "保留全部",
+      "keep100": "自动保留最新 100 篇",
+      "keepLimit": "文章保留数量",
+      "keepHint": "最新 100 篇之外，星标、稍后读和有高亮/笔记的文章也会保留，因此总数可能超过 100。清理后的空闲空间会被后续数据复用；如需缩小数据库文件，可在“高级”里整理数据库。",
+
       "searchPlaceholder": "在订阅源中查找…",
       "importOpml": "导入 OPML",
       "export": "导出",
@@ -623,6 +635,8 @@
     }
   },
   "sidebar": {
+    "copyFeedUrl": "复制订阅链接",
+    "feedUrlCopied": "订阅链接已复制",
     "searchArticles": "搜索文章",
     "library": "资料库",
     "feeds": "订阅源",
@@ -695,7 +709,7 @@
     "emptyFeedTitle": "订阅源名称不能为空",
     "emptyFolderName": "文件夹名称不能为空",
     "tagNameExists": "同一父标签下已存在这个名称。",
-    "folderNameExists": "已存在同名文件夹",
+    "folderNameExists": "同一父目录下已存在同名文件夹",
     "emptyRuleQuery": "请为规则至少输入一个关键词",
     "noFeedFound": "在该网址未找到可订阅的源",
     "responseTooLarge": "服务器响应过大",
@@ -719,6 +733,7 @@
     "noInstapaperConfig": "请在 设置 → 集成 中添加 Instapaper 用户名和密码",
     "noKindleConfig": "请在 设置 → 集成 中配置 Kindle 地址和 SMTP 服务器",
     "webdavInvalidUrl": "请输入 HTTP(S) 目录地址，不要在地址中包含账号密码、查询参数或片段。",
+    "feedCleanupChanged": "文章列表已变化，请重新查看清理预览后再确认。",
     "webdavAuthFailed": "WebDAV 验证失败，请检查用户名和密码。",
     "webdavEtagRequired": "此 WebDAV 服务未提供强 ETag，无法安全地进行多设备同步。",
     "webdavTooLarge": "单条同步记录超过 64 MiB，或同步清单过大；文章库总大小没有 128 MiB 限制。",

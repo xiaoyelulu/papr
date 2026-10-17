@@ -169,6 +169,8 @@
     "footerHint": "記事 · フィード · コマンド"
   },
   "reader": {
+    "playYoutube": "アプリ内で再生",
+    "openYoutube": "YouTube で開く",
     "resizeAi": "AI 要約パネルの幅を調整",
     "fullTextExtracted": "全文を抽出しました",
     "linkCopied": "リンクをコピーしました",
@@ -342,6 +344,16 @@
       "defaultOpenModeDesc": "記事を開くときのデフォルトの表示方法。フィードごとに上書きできます"
     },
     "subscriptions": {
+      "cleanup100": "最新 100 件を残して古い記事を削除",
+      "cleanupDone": "古い記事 {{count}} 件を削除しました",
+      "cleanupPreview": "「{{feed}}」の古い記事 {{count}} 件を削除し、{{remaining}} 件を残します。スター、後で読む、注釈付きの記事は保護します。削除は他の端末にも同期され、元に戻せません。",
+      "cleanupAutomatic": "今後の更新後も自動整理を有効にします。",
+      "cleanupConfirm": "削除を確認",
+      "keepAll": "すべて保持",
+      "keep100": "最新 100 件を自動保持",
+      "keepLimit": "記事保持数",
+      "keepHint": "最新 100 件に加え、スター・後で読む・注釈付き記事も保持するため合計が 100 件を超える場合があります。空きページは再利用されます。ファイルを縮小するには詳細設定でデータベースを最適化してください。",
+
       "searchPlaceholder": "フィードを検索…",
       "importOpml": "OPML をインポート",
       "export": "エクスポート",
@@ -623,6 +635,8 @@
     }
   },
   "sidebar": {
+    "copyFeedUrl": "購読 URL をコピー",
+    "feedUrlCopied": "購読 URL をコピーしました",
     "searchArticles": "記事を検索",
     "library": "ライブラリ",
     "feeds": "フィード",
@@ -695,7 +709,7 @@
     "emptyFeedTitle": "フィード名を空にはできません",
     "emptyFolderName": "フォルダー名を空にはできません",
     "tagNameExists": "同じ親タグの下に同名のタグがあります。",
-    "folderNameExists": "同じ名前のフォルダーがすでに存在します",
+    "folderNameExists": "同じ親フォルダー内に同名のフォルダーが存在します",
     "emptyRuleQuery": "ルールにキーワードを1つ以上入力してください",
     "noFeedFound": "その URL ではフィードが見つかりませんでした",
     "responseTooLarge": "サーバーの応答が大きすぎます",
@@ -719,6 +733,7 @@
     "noInstapaperConfig": "設定 → 連携 で Instapaper のユーザー名とパスワードを追加してください",
     "noKindleConfig": "設定 → 連携 で Kindle アドレスと SMTP サーバーを設定してください",
     "webdavInvalidUrl": "認証情報、クエリ、フラグメントを含まない HTTP(S) ディレクトリ URL を入力してください。",
+    "feedCleanupChanged": "記事一覧が変更されました。もう一度削除内容を確認してください。",
     "webdavAuthFailed": "WebDAV 認証に失敗しました。ユーザー名とパスワードを確認してください。",
     "webdavEtagRequired": "この WebDAV サーバーは強い ETag を提供しないため、安全な端末間同期ができません。",
     "webdavTooLarge": "同期レコード 1 件が 64 MiB を超えているか、一覧ファイルが大きすぎます。ライブラリ全体の 128 MiB 制限はありません。",

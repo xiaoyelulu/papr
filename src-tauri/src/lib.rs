@@ -9,6 +9,7 @@
 pub use papr_core::{ai, db, error, extraction, ingestion, models, opml, sanitize, sync};
 
 mod backing;
+mod youtube;
 mod commands;
 mod notify;
 #[cfg(desktop)]
@@ -264,6 +265,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            youtube::open_youtube_player,
             commands::list_folders,
             commands::create_folder,
             commands::move_folder,
@@ -275,6 +277,9 @@ pub fn run() {
             commands::delete_feed,
             commands::move_feed,
             commands::set_feed_refresh_interval,
+            commands::preview_feed_cleanup,
+            commands::cleanup_feed_articles,
+            commands::disable_feed_limit,
             commands::set_feed_auto_translate,
             commands::set_feed_open_mode,
             commands::rename_feed,

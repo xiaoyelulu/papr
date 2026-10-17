@@ -424,3 +424,10 @@ export const webdavDisconnect = () => invoke<void>("webdav_disconnect");
 export const webdavSync = () => invoke<number>("webdav_sync");
 export const setReadingProgress = (id: number, progress: number) =>
   invoke<void>("set_reading_progress", { id, progress });
+
+export const openYoutubePlayer = (videoId: string) => invoke<void>("open_youtube_player", { videoId });
+
+export interface FeedCleanupPlan { total: number; remove: number; protected: number; token: string }
+export const previewFeedCleanup = (id: number) => invoke<FeedCleanupPlan>("preview_feed_cleanup", { id });
+export const cleanupFeedArticles = (id: number, token: string, automatic: boolean) => invoke<number>("cleanup_feed_articles", { id, token, automatic });
+export const disableFeedLimit = (id: number) => invoke<void>("disable_feed_limit", { id });

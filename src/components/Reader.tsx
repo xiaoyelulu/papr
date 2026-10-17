@@ -23,6 +23,7 @@ import ResizeHandle from "./ResizeHandle";
 import HighlightLayer from "./HighlightLayer";
 import ContextMenu, { type MenuEntry } from "./ContextMenu";
 import Lightbox from "./Lightbox";
+import YoutubePlayer from "./YoutubePlayer";
 
 interface Props {
   onToast: (msg: string) => void;
@@ -1084,15 +1085,7 @@ export default function Reader({ onToast }: Props) {
           )}
 
           {ytId ? (
-            <iframe
-              style={{ width: "100%", aspectRatio: "16 / 9" }}
-              // Privacy-enhanced host: YouTube sets no tracking cookies
-              // until the viewer actually starts the video.
-              src={`https://www.youtube-nocookie.com/embed/${ytId}`}
-              title={a.title}
-              referrerPolicy="strict-origin-when-cross-origin"
-              allowFullScreen
-            />
+            <YoutubePlayer videoId={ytId} title={a.title} />
           ) : (
             a.imageUrl &&
             !heroBroken &&

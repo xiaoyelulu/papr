@@ -52,7 +52,7 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         CFBundleShortVersionString: 0.16.1
-        CFBundleVersion: "5"
+        CFBundleVersion: "6"
     entitlements:
       path: papr_iOS/papr_iOS.entitlements
     scheme:
