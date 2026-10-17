@@ -1,4 +1,4 @@
-//! WebDAV transport for logical library snapshots (GET + conditional PUT).
+//! WebDAV transport: compressed incremental chunks and a conditional root.
 //! A strong ETag is required for existing files: unsupported concurrency
 //! protection fails closed instead of overwriting another device's upload.
 use crate::db::{
@@ -13,9 +13,12 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use url::Url;
 
+mod chunks;
+pub(crate) use chunks::schema as chunk_schema;
+
 type Db = Mutex<Connection>;
 const FILE: &str = "papr-library-v1.json";
-const MAX_BYTES: usize = 128 * 1024 * 1024;
+const LEGACY_MAX_BYTES: usize = 128 * 1024 * 1024;
 // Serialize connect/disconnect/run in this process, including the scheduler.
 static SYNC_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -134,20 +137,14 @@ async fn ensure_collection(http: &Client, c: &Credentials) -> AppResult<()> {
     }
 }
 
-async fn download(http: &Client, c: &Credentials) -> AppResult<(Snapshot, Option<String>)> {
+async fn download(http: &Client, c: &Credentials) -> AppResult<(Root, Option<String>)> {
     let mut resp = request(http, c, reqwest::Method::GET, c.url.join(FILE)?)
         .header(header::CACHE_CONTROL, "no-cache")
         .send()
         .await
         .map_err(network_error)?;
     if resp.status() == StatusCode::NOT_FOUND {
-        return Ok((
-            Snapshot {
-                version: 5,
-                records: Vec::new(),
-            },
-            None,
-        ));
+        return Ok((Root::Manifest(chunks::Manifest::empty()), None));
     }
     if !resp.status().is_success() {
         return Err(http_error(resp.status()));
@@ -159,25 +156,71 @@ async fn download(http: &Client, c: &Credentials) -> AppResult<(Snapshot, Option
         .filter(|v| v.starts_with('"') && v.ends_with('"'))
         .ok_or_else(|| AppError::code("webdavEtagRequired"))?
         .to_string();
-    if resp.content_length().is_some_and(|n| n > MAX_BYTES as u64) {
+    if resp
+        .content_length()
+        .is_some_and(|n| n > LEGACY_MAX_BYTES as u64)
+    {
         return Err(AppError::code("webdavTooLarge"));
     }
     let mut body = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(network_error)? {
-        if body.len() + chunk.len() > MAX_BYTES {
+        if body.len() + chunk.len() > LEGACY_MAX_BYTES {
             return Err(AppError::code("webdavTooLarge"));
         }
         body.extend_from_slice(&chunk);
     }
-    let mut snapshot: Snapshot =
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let version: Version =
         serde_json::from_slice(&body).map_err(|_| AppError::code("webdavInvalidData"))?;
-    if !matches!(snapshot.version, 1 | 2 | 3 | 4 | 5) {
+    let root = if version.version == 6 {
+        if body.len() > 16 * 1024 * 1024 {
+            return Err(AppError::code("webdavTooLarge"));
+        }
+        let manifest: chunks::Manifest =
+            serde_json::from_slice(&body).map_err(|_| AppError::code("webdavInvalidData"))?;
+        manifest.validate()?;
+        Root::Manifest(manifest)
+    } else if (1..=5).contains(&version.version) {
+        let mut snapshot: Snapshot =
+            serde_json::from_slice(&body).map_err(|_| AppError::code("webdavInvalidData"))?;
+        if snapshot.version < 4 {
+            replication::upgrade_legacy_tags(&mut snapshot.records)?;
+        }
+        Root::Legacy(snapshot)
+    } else {
         return Err(AppError::code("webdavVersion"));
+    };
+    Ok((root, Some(etag)))
+}
+
+enum Root {
+    Legacy(Snapshot),
+    Manifest(chunks::Manifest),
+}
+
+async fn fetch_chunk(http: &Client, c: &Credentials, p: &chunks::Part) -> AppResult<Vec<u8>> {
+    let mut resp = request(http, c, reqwest::Method::GET, c.url.join(&chunks::path(p))?)
+        .header(header::ACCEPT_ENCODING, "identity")
+        .send()
+        .await
+        .map_err(network_error)?;
+    if !resp.status().is_success() {
+        return Err(http_error(resp.status()));
     }
-    if snapshot.version < 4 {
-        replication::upgrade_legacy_tags(&mut snapshot.records)?;
+    if resp.content_length().is_some_and(|n| n != p.bytes as u64) {
+        return Err(AppError::code("webdavInvalidData"));
     }
-    Ok((snapshot, Some(etag)))
+    let mut body = Vec::with_capacity(p.bytes);
+    while let Some(b) = resp.chunk().await.map_err(network_error)? {
+        if body.len() + b.len() > p.bytes {
+            return Err(AppError::code("webdavInvalidData"));
+        }
+        body.extend_from_slice(&b);
+    }
+    Ok(body)
 }
 
 /// Verify read and write access using a disposable file. Never upload or merge
@@ -235,6 +278,10 @@ pub async fn connect(
         tx.execute("DELETE FROM webdav_baseline", [])?;
         tx.execute("DELETE FROM webdav_conflicts", [])?;
         tx.execute("DELETE FROM webdav_observed", [])?;
+        tx.execute("DELETE FROM webdav_incoming", [])?;
+        tx.execute("DELETE FROM webdav_incoming_chunks", [])?;
+        tx.execute("DELETE FROM webdav_objects", [])?;
+        tx.execute("DELETE FROM webdav_buckets", [])?;
     }
     for (key, value) in [
         ("webdav_url", c.url.as_str()),
@@ -313,21 +360,64 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
     let mut total = 0;
     for _ in 0..3 {
         let (remote, etag) = download(http, c).await?;
-        let snapshot = {
-            let mut conn = db.lock().await;
-            total += replication::merge_remote(&mut conn, &remote.records)?;
-            Snapshot {
-                version: 5,
-                records: replication::records(&conn)?,
+        match &remote {
+            Root::Legacy(snapshot) => chunks::stage_legacy(&mut *db.lock().await, snapshot)?,
+            Root::Manifest(manifest) => {
+                for p in &manifest.chunks {
+                    let present = chunks::available(&*db.lock().await, p)?;
+                    if !present {
+                        let body = fetch_chunk(http, c, p).await?;
+                        chunks::cache(&*db.lock().await, p, &body)?;
+                    }
+                }
+                chunks::stage(&mut *db.lock().await, manifest)?;
             }
+        }
+        let outgoing = {
+            let mut conn = db.lock().await;
+            total += replication::merge_staged(&mut conn)?;
+            chunks::export(&mut conn)?
         };
-        if snapshot.records == remote.records {
-            replication::acknowledge(&*db.lock().await, &snapshot.records)?;
+        let remote_parts = match &remote {
+            Root::Manifest(m) => m
+                .chunks
+                .iter()
+                .map(|p| p.hash.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            _ => Default::default(),
+        };
+        if etag.is_some() && matches!(&remote,Root::Manifest(m) if *m==outgoing) {
+            chunks::acknowledge(&*db.lock().await)?;
+            chunks::prune(&*db.lock().await)?;
             return Ok(total);
         }
+        // Publish immutable objects first. A partial upload cannot expose an
+        // incomplete snapshot; the old conditional root remains authoritative.
+        for p in &outgoing.chunks {
+            if remote_parts.contains(p.hash.as_str()) {
+                continue;
+            }
+            let body = chunks::cached(&*db.lock().await, p)?
+                .ok_or_else(|| AppError::code("webdavInvalidData"))?;
+            let resp = request(http, c, reqwest::Method::PUT, c.url.join(&chunks::path(p))?)
+                .header(header::IF_NONE_MATCH, "*")
+                .header(header::CONTENT_TYPE, "application/gzip")
+                .body(body)
+                .send()
+                .await
+                .map_err(network_error)?;
+            if resp.status() == StatusCode::PRECONDITION_FAILED {
+                // Existing content-addressed objects are reusable only after
+                // verifying their actual bytes (also resumes interrupted runs).
+                let body = fetch_chunk(http, c, p).await?;
+                chunks::cache(&*db.lock().await, p, &body)?;
+            } else if !resp.status().is_success() {
+                return Err(http_error(resp.status()));
+            }
+        }
         let body =
-            serde_json::to_vec(&snapshot).map_err(|_| AppError::code("webdavInvalidData"))?;
-        if body.len() > MAX_BYTES {
+            serde_json::to_vec(&outgoing).map_err(|_| AppError::code("webdavInvalidData"))?;
+        if body.len() > 16 * 1024 * 1024 {
             return Err(AppError::code("webdavTooLarge"));
         }
         let mut req = request(http, c, reqwest::Method::PUT, c.url.join(FILE)?)
@@ -347,7 +437,8 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
         if !resp.status().is_success() {
             return Err(http_error(resp.status()));
         }
-        replication::acknowledge(&*db.lock().await, &snapshot.records)?;
+        chunks::acknowledge(&*db.lock().await)?;
+        chunks::prune(&*db.lock().await)?;
         return Ok(total);
     }
     Err(AppError::code("webdavConflict"))
@@ -356,17 +447,22 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Default)]
     struct Server {
         body: Option<Vec<u8>>,
+        objects: std::collections::BTreeMap<String, Vec<u8>>,
+        chunk_gets: usize,
+        chunk_puts: usize,
         revision: u64,
         conflict: bool,
         missing_etag: bool,
         deny: bool,
         fail_upload: bool,
+        fail_root: bool,
         conditional_writes: usize,
     }
     async fn server() -> (String, Arc<StdMutex<Server>>, tokio::task::JoinHandle<()>) {
@@ -412,6 +508,8 @@ mod tests {
                 let (code, etag, body) = {
                     let mut s = shared.lock().unwrap();
                     let method = headers.split_whitespace().next().unwrap();
+                    let path = headers.split_whitespace().nth(1).unwrap().to_string();
+                    let object = path.contains("papr-chunk-v6-");
                     let probe = headers.lines().next().unwrap().contains(".papr-test-");
                     if s.deny {
                         (401, None, Vec::new())
@@ -419,6 +517,27 @@ mod tests {
                         (405, None, Vec::new())
                     } else if probe {
                         (if method == "PUT" { 201 } else { 204 }, None, Vec::new())
+                    } else if object {
+                        if method == "GET" {
+                            s.chunk_gets += 1;
+                            match s.objects.get(&path) {
+                                Some(b) => (200, None, b.clone()),
+                                None => (404, None, Vec::new()),
+                            }
+                        } else if method == "PUT" {
+                            assert!(headers.to_ascii_lowercase().contains("if-none-match: *"));
+                            s.chunk_puts += 1;
+                            if s.fail_upload || s.fail_root {
+                                (500, None, Vec::new())
+                            } else if s.objects.contains_key(&path) {
+                                (412, None, Vec::new())
+                            } else {
+                                s.objects.insert(path, bytes[end..end + length].to_vec());
+                                (201, None, Vec::new())
+                            }
+                        } else {
+                            (400, None, Vec::new())
+                        }
                     } else if method == "GET" {
                         match s.body.clone() {
                             Some(body) => (
@@ -441,7 +560,7 @@ mod tests {
                             "if-none-match: *".into()
                         };
                         assert!(lower.contains(&expected), "Missing condition: {headers}");
-                        if s.fail_upload {
+                        if s.fail_upload || s.fail_root {
                             (500, None, Vec::new())
                         } else if s.conflict {
                             s.conflict = false;
@@ -501,6 +620,7 @@ mod tests {
         );
         sync_now(&a, &http).await.unwrap();
         connect(&b, &http, &url, "alice", "SECRET").await.unwrap();
+        db::set_setting(&*b.lock().await, "ai_summary_prompt", "retry prompt").unwrap();
         server.lock().unwrap().conflict = true;
         sync_now(&b, &http).await.unwrap();
         {
@@ -517,11 +637,11 @@ mod tests {
                 .unwrap()
                 .contains("SECRET")
         );
-        assert_eq!(server.lock().unwrap().conditional_writes, 3);
+        assert_eq!(server.lock().unwrap().conditional_writes, 4);
         sync_now(&a, &http).await.unwrap();
         assert_eq!(
             server.lock().unwrap().conditional_writes,
-            3,
+            4,
             "Idle sync must not upload again"
         );
         disconnect(&a).await.unwrap();
@@ -532,39 +652,69 @@ mod tests {
     #[tokio::test]
     async fn ai_preferences_sync_over_http_with_conflict_review_and_no_secrets() {
         let (url, server, task) = server().await;
-        let http=client(); let a=database(); let b=database();
+        let http = client();
+        let a = database();
+        let b = database();
         {
-            let c=a.lock().await;
-            db::configure_ai_selection(&c,"codex",Some("shared-model"),None,Some("high")).unwrap();
-            db::set_setting(&c,"ai_summary_prompt","Shared prompt").unwrap();
-            db::set_setting(&c,"ai_api_key","SECRET_AI_KEY").unwrap();
-            db::set_setting(&c,"ai_base_url","https://SECRET@example.com/v1").unwrap();
+            let c = a.lock().await;
+            db::configure_ai_selection(&c, "codex", Some("shared-model"), None, Some("high"))
+                .unwrap();
+            db::set_setting(&c, "ai_summary_prompt", "Shared prompt").unwrap();
+            db::set_setting(&c, "ai_api_key", "SECRET_AI_KEY").unwrap();
+            db::set_setting(&c, "ai_base_url", "https://SECRET@example.com/v1").unwrap();
         }
-        connect(&a,&http,&url,"a","SECRET_DAV").await.unwrap();
-        sync_now(&a,&http).await.unwrap();
-        connect(&b,&http,&url,"a","SECRET_DAV").await.unwrap();
-        sync_now(&b,&http).await.unwrap();
+        connect(&a, &http, &url, "a", "SECRET_DAV").await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        connect(&b, &http, &url, "a", "SECRET_DAV").await.unwrap();
+        sync_now(&b, &http).await.unwrap();
         {
-            let c=b.lock().await;
-            assert_eq!(db::get_setting(&c,"ai_provider").unwrap().as_deref(),Some("codex"));
-            assert_eq!(db::get_setting(&c,"ai_model").unwrap().as_deref(),Some("shared-model"));
-            assert_eq!(db::get_setting(&c,"ai_reasoning_effort_codex").unwrap().as_deref(),Some("high"));
-            assert_eq!(db::get_setting(&c,"ai_summary_prompt").unwrap().as_deref(),Some("Shared prompt"));
-            assert!(db::get_setting(&c,"ai_api_key").unwrap().is_none());
-            db::set_setting(&c,"ai_summary_prompt","Device B prompt").unwrap();
+            let c = b.lock().await;
+            assert_eq!(
+                db::get_setting(&c, "ai_provider").unwrap().as_deref(),
+                Some("codex")
+            );
+            assert_eq!(
+                db::get_setting(&c, "ai_model").unwrap().as_deref(),
+                Some("shared-model")
+            );
+            assert_eq!(
+                db::get_setting(&c, "ai_reasoning_effort_codex")
+                    .unwrap()
+                    .as_deref(),
+                Some("high")
+            );
+            assert_eq!(
+                db::get_setting(&c, "ai_summary_prompt").unwrap().as_deref(),
+                Some("Shared prompt")
+            );
+            assert!(db::get_setting(&c, "ai_api_key").unwrap().is_none());
+            db::set_setting(&c, "ai_summary_prompt", "Device B prompt").unwrap();
         }
-        db::set_setting(&*a.lock().await,"ai_summary_prompt","Device A prompt").unwrap();
-        sync_now(&a,&http).await.unwrap();
-        let before=server.lock().unwrap().body.clone();
-        assert!(matches!(sync_now(&b,&http).await,Err(AppError::Coded("webdavNeedsResolution"))));
-        assert_eq!(server.lock().unwrap().body,before);
-        let c=conflicts(&b).await.unwrap().remove(0); assert_eq!(c.kind,"ai_prompt");
-        resolve(&b,"ai_prompt","summary","local").await.unwrap();
-        sync_now(&b,&http).await.unwrap(); sync_now(&a,&http).await.unwrap();
-        assert_eq!(db::get_setting(&*a.lock().await,"ai_summary_prompt").unwrap().as_deref(),Some("Device B prompt"));
-        let body=String::from_utf8(server.lock().unwrap().body.clone().unwrap()).unwrap();
+        db::set_setting(&*a.lock().await, "ai_summary_prompt", "Device A prompt").unwrap();
+        sync_now(&a, &http).await.unwrap();
+        let before = server.lock().unwrap().body.clone();
+        assert!(matches!(
+            sync_now(&b, &http).await,
+            Err(AppError::Coded("webdavNeedsResolution"))
+        ));
+        assert_eq!(server.lock().unwrap().body, before);
+        let c = conflicts(&b).await.unwrap().remove(0);
+        assert_eq!(c.kind, "ai_prompt");
+        resolve(&b, "ai_prompt", "summary", "local").await.unwrap();
+        sync_now(&b, &http).await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        assert_eq!(
+            db::get_setting(&*a.lock().await, "ai_summary_prompt")
+                .unwrap()
+                .as_deref(),
+            Some("Device B prompt")
+        );
+        let body = String::from_utf8(server.lock().unwrap().body.clone().unwrap()).unwrap();
         assert!(!body.contains("SECRET"));
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["version"],5);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["version"],
+            6
+        );
         task.abort();
     }
     #[tokio::test]
@@ -660,6 +810,222 @@ mod tests {
         sync_now(&a, &http).await.unwrap();
         assert!(status(&a).await.unwrap().last_error.is_none());
         task.abort();
+    }
+    #[tokio::test]
+    async fn migrates_legacy_and_only_transfers_changed_state_chunks() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        let b = database();
+        seed(&a).await;
+        {
+            let c = a.lock().await;
+            c.execute(
+                "UPDATE articles SET body_text=?1 WHERE id=1",
+                ["article body ".repeat(100_000)],
+            )
+            .unwrap();
+            let mut s = server.lock().unwrap();
+            s.body = Some(
+                serde_json::to_vec(&Snapshot {
+                    version: 5,
+                    records: replication::records(&c).unwrap(),
+                })
+                .unwrap(),
+            );
+            s.revision = 1;
+        }
+        connect(&a, &http, &url, "u", "p").await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        let old: chunks::Manifest =
+            serde_json::from_slice(server.lock().unwrap().body.as_ref().unwrap()).unwrap();
+        assert_eq!(old.version, 6);
+        connect(&b, &http, &url, "u", "p").await.unwrap();
+        sync_now(&b, &http).await.unwrap();
+        let (puts, gets) = {
+            let s = server.lock().unwrap();
+            (s.chunk_puts, s.chunk_gets)
+        };
+        sync_now(&a, &http).await.unwrap();
+        sync_now(&b, &http).await.unwrap();
+        {
+            let s = server.lock().unwrap();
+            assert_eq!((s.chunk_puts, s.chunk_gets), (puts, gets));
+        }
+        replication::set_progress(&*a.lock().await, 1, 0.73).unwrap();
+        sync_now(&a, &http).await.unwrap();
+        let new: chunks::Manifest =
+            serde_json::from_slice(server.lock().unwrap().body.as_ref().unwrap()).unwrap();
+        let article_hashes = |m: &chunks::Manifest| {
+            m.chunks
+                .iter()
+                .filter(|p| p.kind == "article")
+                .map(|p| p.hash.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(article_hashes(&old), article_hashes(&new));
+        assert_eq!(server.lock().unwrap().chunk_puts, puts + 1);
+        sync_now(&b, &http).await.unwrap();
+        assert_eq!(server.lock().unwrap().chunk_gets, gets + 1);
+        assert_eq!(
+            db::get_article(&*b.lock().await, 1)
+                .unwrap()
+                .reading_progress,
+            0.73
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn corrupt_or_missing_chunks_do_not_partially_import() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        let b = database();
+        seed(&a).await;
+        connect(&a, &http, &url, "u", "p").await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        connect(&b, &http, &url, "u", "p").await.unwrap();
+        let (path, bytes) = {
+            let s = server.lock().unwrap();
+            let (p, b) = s.objects.iter().next_back().unwrap();
+            (p.clone(), b.clone())
+        };
+        server
+            .lock()
+            .unwrap()
+            .objects
+            .insert(path.clone(), vec![b'x'; bytes.len()]);
+        assert!(matches!(
+            sync_now(&b, &http).await,
+            Err(AppError::Coded("webdavInvalidData"))
+        ));
+        assert_eq!(
+            b.lock()
+                .await
+                .query_row("SELECT count(*) FROM feeds", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        server.lock().unwrap().objects.remove(&path);
+        assert!(sync_now(&b, &http).await.is_err());
+        assert_eq!(
+            b.lock()
+                .await
+                .query_row("SELECT count(*) FROM feeds", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        server.lock().unwrap().objects.insert(path, bytes);
+        sync_now(&b, &http).await.unwrap();
+        assert_eq!(
+            db::get_article(&*b.lock().await, 1).unwrap().title,
+            "Article"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn manifest_compare_and_swap_failure_keeps_old_snapshot_and_resumes() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        let b = database();
+        seed(&a).await;
+        connect(&a, &http, &url, "u", "p").await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        let before = server.lock().unwrap().body.clone();
+        replication::set_progress(&*a.lock().await, 1, 0.5).unwrap();
+        // The root fails after all immutable chunks have been published.
+        server.lock().unwrap().fail_root = true;
+        assert!(sync_now(&a, &http).await.is_err());
+        assert_eq!(server.lock().unwrap().body, before);
+        connect(&b, &http, &url, "u", "p").await.unwrap();
+        sync_now(&b, &http).await.unwrap();
+        assert_eq!(
+            db::get_article(&*b.lock().await, 1)
+                .unwrap()
+                .reading_progress,
+            0.0
+        );
+        server.lock().unwrap().fail_root = false;
+        sync_now(&a, &http).await.unwrap();
+        sync_now(&b, &http).await.unwrap();
+        assert_eq!(
+            db::get_article(&*b.lock().await, 1)
+                .unwrap()
+                .reading_progress,
+            0.5
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "large disk-backed integration test: transfers over 1.3 GiB of logical article data"]
+    async fn library_over_1_3_gib_round_trips_with_bounded_chunks() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let dir = std::env::temp_dir().join(format!("papr-large-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = Mutex::new(db::open(&dir.join("a.db")).unwrap());
+        let b = Mutex::new(db::open(&dir.join("b.db")).unwrap());
+        {
+            let mut c = a.lock().await;
+            let tx = c.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO feeds(feed_url,title) VALUES('https://example.com/rss','Large test')",
+                [],
+            )
+            .unwrap();
+            let text = "large library article ".repeat(50_000); // 1.1 MB per article
+            for i in 0..1400 {
+                tx.execute("INSERT INTO articles(feed_id,guid,title,body_text) VALUES(1,?1,'Large article',?2)",params![format!("large-{i:05}"),text]).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        println!("Large fixture seeded; starting initial upload");
+        connect(&a, &http, &url, "u", "p").await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        println!("Initial upload completed; starting download/import on second device");
+        let m: chunks::Manifest =
+            serde_json::from_slice(server.lock().unwrap().body.as_ref().unwrap()).unwrap();
+        let raw: usize = m.chunks.iter().map(|p| p.raw_bytes).sum();
+        let zipped: usize = m.chunks.iter().map(|p| p.bytes).sum();
+        assert!(raw > 13 * 1024 * 1024 * 1024 / 10);
+        assert!(m.chunks.iter().all(|p| p.raw_bytes <= chunks::MAX_CHUNK));
+        connect(&b, &http, &url, "u", "p").await.unwrap();
+        sync_now(&b, &http).await.unwrap();
+        assert_eq!(
+            b.lock()
+                .await
+                .query_row(
+                    "SELECT count(*),sum(length(body_text)) FROM articles",
+                    [],
+                    |r| Ok((r.get::<_, usize>(0)?, r.get::<_, usize>(1)?))
+                )
+                .unwrap(),
+            (1400, "large library article ".len() * 50_000 * 1400)
+        );
+        let (puts, gets) = {
+            let s = server.lock().unwrap();
+            (s.chunk_puts, s.chunk_gets)
+        };
+        replication::set_progress(&*a.lock().await, 1, 0.42).unwrap();
+        sync_now(&a, &http).await.unwrap();
+        sync_now(&b, &http).await.unwrap();
+        assert_eq!(server.lock().unwrap().chunk_puts, puts + 1);
+        assert_eq!(server.lock().unwrap().chunk_gets, gets + 1);
+        assert_eq!(
+            db::get_article(&*b.lock().await, 1)
+                .unwrap()
+                .reading_progress,
+            0.42
+        );
+        println!("Large sync: {raw} uncompressed bytes, {zipped} compressed bytes, {} chunks; subsequent progress edit transferred one chunk in each direction",m.chunks.len());
+        drop(a);
+        drop(b);
+        task.abort();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn validates_directory_urls() {

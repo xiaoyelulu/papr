@@ -314,6 +314,7 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
         M::up(webdav::tag_schema()),
         M::up(webdav::scoped_tag_schema()),
         M::up(webdav::ai_preferences_schema()),
+        M::up(crate::webdav::chunk_schema()),
     ])
 });
 
@@ -353,7 +354,55 @@ pub fn open(path: &Path) -> AppResult<Connection> {
     conn.pragma_update(None, "busy_timeout", 5000)?;
     MIGRATIONS.to_latest(&mut conn)?;
     register_functions(&conn)?;
+    upgrade_legacy_folder_paths(&mut conn)?;
     Ok(conn)
+}
+
+/// Upgrade pre-hierarchy folder labels such as `01 AI AGENT/公众号` once.
+/// Preserve the original leaf ID whenever possible; every path is a savepoint
+/// so ambiguous names remain intact instead of stealing another folder's feeds.
+fn upgrade_legacy_folder_paths(conn: &mut Connection) -> AppResult<()> {
+    if get_setting(conn,"folder_path_upgrade_v1")?.as_deref()==Some("done") { return Ok(()); }
+    let mut tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let folders:Vec<(i64,String)>={
+        let mut stmt=tx.prepare("SELECT id,name FROM folders WHERE parent_id IS NULL AND instr(name,'/')>0 ORDER BY length(name)-length(replace(name,'/','')),position,id")?;
+        let rows=stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        rows.collect::<Result<_,_>>()?
+    };
+    for (id,path) in folders {
+        let parts:Vec<_>=path.split('/').map(str::trim).collect();
+        if parts.len()>32 || parts.iter().any(|p|p.is_empty()) {continue;}
+        let sp=tx.savepoint()?;
+        let result=(||->AppResult<()> {
+            let mut parent=None;
+            for part in &parts[..parts.len()-1] {
+                let next=create_folder_in(&sp,part,parent)?;
+                let actual:Option<i64>=sp.query_row("SELECT parent_id FROM folders WHERE id=?1",[next],|r|r.get(0))?;
+                if actual!=parent || next==id {return Err(AppError::code("folderNameExists"));}
+                parent=Some(next);
+            }
+            let leaf=parts.last().unwrap();
+            let existing:Option<(i64,Option<i64>)>=sp.query_row("SELECT id,parent_id FROM folders WHERE name=?1 COLLATE NOCASE AND id!=?2",params![leaf,id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            if let Some((target,target_parent))=existing {
+                if target_parent!=parent {return Err(AppError::code("folderNameExists"));}
+                sp.execute("UPDATE feeds SET folder_id=?2 WHERE folder_id=?1",params![id,target])?;
+                sp.execute("UPDATE folders SET parent_id=?2 WHERE parent_id=?1",params![id,target])?;
+                sp.execute("DELETE FROM folders WHERE id=?1",[id])?;
+            } else {
+                rename_folder(&sp,id,leaf)?;
+                sp.execute("UPDATE folders SET parent_id=?2 WHERE id=?1",params![id,parent])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(())=>sp.commit()?,
+            Err(AppError::Coded("folderNameExists"|"folderCycle"))=>{drop(sp);},
+            Err(error)=>return Err(error),
+        }
+    }
+    set_setting(&tx,"folder_path_upgrade_v1","done")?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Open a read-only connection for the UI query pool. Under WAL these run
@@ -2657,6 +2706,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn folder_path_upgrade_preserves_ids_subscriptions_and_reading_state() {
+        let mut conn=Connection::open_in_memory().unwrap();MIGRATIONS.to_latest(&mut conn).unwrap();
+        conn.execute("INSERT INTO folders(id,name) VALUES(10,'01 AI AGENT/公众号'),(11,'01 AI AGENT/订阅/技术')",[]).unwrap();
+        conn.execute("INSERT INTO feeds(id,feed_url,title,folder_id) VALUES(1,'https://example.com/rss','Feed',10)",[]).unwrap();
+        conn.execute("INSERT INTO articles(feed_id,guid,title,is_read,is_starred,read_later,reading_progress) VALUES(1,'one','Preserved article',1,1,1,0.7)",[]).unwrap();
+        upgrade_legacy_folder_paths(&mut conn).unwrap();
+        let parent:i64=conn.query_row("SELECT id FROM folders WHERE name='01 AI AGENT'",[],|r|r.get(0)).unwrap();
+        assert_eq!(conn.query_row("SELECT name,parent_id FROM folders WHERE id=10",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).unwrap(),("公众号".into(),parent));
+        assert_eq!(conn.query_row("SELECT count(*) FROM folders WHERE name='01 AI AGENT'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(conn.query_row("SELECT folder_id FROM feeds WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),10);
+        let detail=get_article(&conn,1).unwrap();assert!(detail.is_read&&detail.is_starred&&detail.read_later);assert_eq!(detail.reading_progress,0.7);
+        let before=webdav::records(&conn).unwrap();upgrade_legacy_folder_paths(&mut conn).unwrap();assert_eq!(webdav::records(&conn).unwrap(),before);
+        let mut other=open(Path::new(":memory:")).unwrap();webdav::merge_remote(&mut other,&before).unwrap();
+        let detail=get_article(&other,1).unwrap();assert!(detail.is_read&&detail.is_starred&&detail.read_later);assert_eq!(detail.reading_progress,0.7);
+    }
+
+    #[test]
+    fn folder_path_upgrade_reuses_exact_path_and_keeps_ambiguous_paths() {
+        let mut conn=Connection::open_in_memory().unwrap();MIGRATIONS.to_latest(&mut conn).unwrap();
+        conn.execute("INSERT INTO folders(id,name,parent_id) VALUES(1,'Root',NULL),(2,'Leaf',1),(3,'Root/Leaf',NULL),(4,'Other/Leaf',NULL),(5,'Invalid//Leaf',NULL)",[]).unwrap();
+        conn.execute("INSERT INTO feeds(feed_url,title,folder_id) VALUES('https://example.com/rss','Feed',3)",[]).unwrap();
+        upgrade_legacy_folder_paths(&mut conn).unwrap();
+        assert_eq!(conn.query_row("SELECT folder_id FROM feeds",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        assert_eq!(conn.query_row("SELECT count(*) FROM folders WHERE id=3",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(conn.query_row("SELECT name FROM folders WHERE id=4",[],|r|r.get::<_,String>(0)).unwrap(),"Other/Leaf");
+        assert_eq!(conn.query_row("SELECT count(*) FROM folders WHERE name='Other'",[],|r|r.get::<_,i64>(0)).unwrap(),0,"Failed path must roll back its newly created prefixes");
+        assert_eq!(conn.query_row("SELECT name FROM folders WHERE id=5",[],|r|r.get::<_,String>(0)).unwrap(),"Invalid//Leaf");
+    }
+
+    #[test]
     fn ai_sync_migration_seeds_existing_preferences_and_preserves_private_settings() {
         let mut conn=Connection::open_in_memory().unwrap();
         MIGRATIONS.to_version(&mut conn,25).unwrap();
@@ -2676,28 +2755,28 @@ mod tests {
     }
     #[test]
     fn startup_migrations_preserve_existing_databases() {
-        for version in [0, 19, 20, 21, 22, 23, 24, 25, 26, 27] {
+        for version in [0, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28] {
             let path = std::env::temp_dir().join(format!("papr-migrations-{}-{}-{}.db",
                 std::process::id(), version,
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             let mut conn = Connection::open(&path).unwrap();
-            MIGRATIONS.to_version(&mut conn, version.min(26)).unwrap();
+            MIGRATIONS.to_version(&mut conn, version.min(27)).unwrap();
             if version > 0 {
                 conn.execute("INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.com/rss','Preserved')", []).unwrap();
                 conn.execute("INSERT INTO articles(feed_id,guid,title,is_starred) VALUES(1,'one','Article',1)", []).unwrap();
             }
             if version >= 20 { conn.execute("UPDATE feeds SET custom_favicon=1", []).unwrap(); }
             if version >= 21 { conn.execute("UPDATE feeds SET position=42", []).unwrap(); }
-            if version == 27 { conn.pragma_update(None, "user_version", 27).unwrap(); }
+            if version == 28 { conn.pragma_update(None, "user_version", 28).unwrap(); }
             drop(conn);
             let result = open(&path);
-            if version == 27 {
+            if version == 28 {
                 assert!(result.is_err());
                 let conn = Connection::open(&path).unwrap();
-                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 27);
+                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 28);
             } else {
                 let conn = result.unwrap();
-                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 26);
+                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 27);
                 if version > 0 {
                     let values: (String,i64,i64) = conn.query_row("SELECT title,custom_favicon,position FROM feeds WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
                     assert_eq!(values, ("Preserved".into(), i64::from(version>=20), if version>=21 {42} else {0}));

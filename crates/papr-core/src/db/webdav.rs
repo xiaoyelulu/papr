@@ -244,13 +244,20 @@ fn tag_specs_v25() -> Vec<Spec> {
 fn current_specs() -> Vec<Spec> {
     let mut all = tag_specs_v25();
     for (kind, key, fields) in [
-        ("ai_config", "selection", vec!["provider", "model", "effort"]),
+        (
+            "ai_config",
+            "selection",
+            vec!["provider", "model", "effort"],
+        ),
         ("ai_prompt", "summary", vec!["prompt"]),
     ] {
         all.push(Spec {
-            kind, table: "settings", key: format!("'{key}'"),
+            kind,
+            table: "settings",
+            key: format!("'{key}'"),
             columns: fields.into_iter().map(|s| (s, String::new())).collect(),
-            filter: "1".into(), state: false,
+            filter: "1".into(),
+            state: false,
         });
     }
     all
@@ -651,14 +658,36 @@ fn validate(record: &Record, spec: &Spec) -> AppResult<()> {
         }
     }
     if spec.kind == "ai_config" || spec.kind == "ai_prompt" {
-        if record.deleted || record.key != if spec.kind == "ai_config" { "selection" } else { "summary" }
-            || object.values().any(|v| !v.is_string()) {
+        if record.deleted
+            || record.key
+                != if spec.kind == "ai_config" {
+                    "selection"
+                } else {
+                    "summary"
+                }
+            || object.values().any(|v| !v.is_string())
+        {
             return Err(invalid());
         }
         if spec.kind == "ai_config" {
-            if !matches!(object["provider"].as_str(), Some("anthropic" | "openai" | "deepseek" | "codex"))
-                || object["model"].as_str().unwrap().len() > 512
-                || !matches!(object["effort"].as_str(), Some("" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra")) {
+            if !matches!(
+                object["provider"].as_str(),
+                Some("anthropic" | "openai" | "deepseek" | "codex")
+            ) || object["model"].as_str().unwrap().len() > 512
+                || !matches!(
+                    object["effort"].as_str(),
+                    Some(
+                        "" | "none"
+                            | "minimal"
+                            | "low"
+                            | "medium"
+                            | "high"
+                            | "xhigh"
+                            | "max"
+                            | "ultra"
+                    )
+                )
+            {
                 return Err(invalid());
             }
         } else if object["prompt"].as_str().unwrap().chars().count() > 12000 {
@@ -686,6 +715,18 @@ fn validate(record: &Record, spec: &Spec) -> AppResult<()> {
     Ok(())
 }
 
+pub(crate) fn validate_record(record: &Record) -> AppResult<()> {
+    let r = normalized(record.clone());
+    let specs = current_specs();
+    validate(
+        &r,
+        specs
+            .iter()
+            .find(|s| s.kind == r.kind)
+            .ok_or_else(invalid)?,
+    )
+}
+
 fn newer(remote: &Record, local: &Record) -> bool {
     (
         remote.clock,
@@ -709,120 +750,172 @@ pub fn merge(conn: &mut Connection, incoming: &[Record]) -> AppResult<usize> {
     Ok(changed)
 }
 
+// Input lives on disk, so a multi-gigabyte library never becomes a Vec<Record>.
+const RECORD_JSON: &str = "json_object('kind',kind,'key',key,'clock',clock,'nonce',nonce,'deleted',json(CASE deleted WHEN 1 THEN 'true' ELSE 'false' END),'data',json(data))";
+
+pub fn record_json_sql() -> &'static str {
+    RECORD_JSON
+}
+
+fn lookup(conn: &Connection, kind: &str, key: &str) -> AppResult<Option<Record>> {
+    let json: Option<String> = conn
+        .query_row(
+            &format!("SELECT {RECORD_JSON} FROM webdav_records WHERE kind=?1 AND key=?2"),
+            params![kind, key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    json.map(|s| serde_json::from_str(&s).map_err(|_| invalid()))
+        .transpose()
+}
+
+fn visit(
+    conn: &Connection,
+    sql: &str,
+    mut f: impl FnMut(Record) -> AppResult<()>,
+) -> AppResult<()> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let json: String = row.get(0)?;
+        f(normalized(
+            serde_json::from_str(&json).map_err(|_| invalid())?,
+        ))?;
+    }
+    Ok(())
+}
+
+fn stage_slice(conn: &Connection, incoming: &[Record]) -> AppResult<()> {
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS webdav_input(kind TEXT,key TEXT,record TEXT,PRIMARY KEY(kind,key)); DELETE FROM webdav_input;")?;
+    for r in incoming {
+        validate_record(r)?;
+        conn.execute(
+            "INSERT INTO webdav_input VALUES(?1,?2,?3)",
+            params![
+                r.kind,
+                r.key,
+                serde_json::to_string(r).map_err(|_| invalid())?
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn merge_rows(conn: &Connection, incoming: &[Record]) -> AppResult<usize> {
-    let incoming: Vec<_> = incoming
-        .iter()
-        .cloned()
-        .map(|mut r| {
-            if ["folder", "tag"].contains(&r.kind.as_str()) {
-                if let Some(data) = r.data.as_object_mut() {
-                    data.entry("parent_id").or_insert(Value::Null);
-                }
-            }
-            r
-        })
-        .collect();
+    stage_slice(conn, incoming)?;
+    merge_table(conn, "webdav_input")
+}
+
+fn merge_table(conn: &Connection, table: &str) -> AppResult<usize> {
     let specs = current_specs();
-    for r in &incoming {
-        let spec = specs
-            .iter()
-            .find(|s| s.kind == r.kind)
-            .ok_or_else(invalid)?;
-        validate(r, spec)?;
-    }
-    let mut merged: std::collections::BTreeMap<_, _> = records(conn)?
-        .into_iter()
-        .map(|r| ((r.kind.clone(), r.key.clone()), r))
-        .collect();
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS webdav_changed(kind TEXT,key TEXT,PRIMARY KEY(kind,key)); DELETE FROM webdav_changed;")?;
     let mut changed = 0;
-    for r in &incoming {
-        let key = (r.kind.clone(), r.key.clone());
-        if merged.get(&key).is_none_or(|old| newer(r, old)) {
-            conn.execute(
-                "INSERT OR REPLACE INTO webdav_records VALUES(?1,?2,?3,?4,?5,?6)",
-                params![
-                    r.kind,
-                    r.key,
-                    r.clock,
-                    r.nonce,
-                    r.deleted,
-                    r.data.to_string()
-                ],
+    let filter = if table == "webdav_incoming" {
+        " WHERE chunk IN (SELECT hash FROM webdav_incoming_chunks WHERE dirty=1) OR NOT EXISTS(SELECT 1 FROM webdav_records l WHERE l.kind=webdav_incoming.kind AND l.key=webdav_incoming.key AND (l.clock>webdav_incoming.clock OR (l.clock=webdav_incoming.clock AND l.nonce>=webdav_incoming.nonce)))"
+    } else {
+        ""
+    };
+    visit(
+        conn,
+        &format!("SELECT record FROM {table}{filter} ORDER BY kind,key"),
+        |r| {
+            validate(
+                &r,
+                specs
+                    .iter()
+                    .find(|s| s.kind == r.kind)
+                    .ok_or_else(invalid)?,
             )?;
-            conn.execute(
-                "UPDATE webdav_control SET clock=max(clock,?1) WHERE id=1",
-                [r.clock],
-            )?;
-            merged.insert(key, r.clone());
-            changed += 1;
-        }
-    }
+            if lookup(conn, &r.kind, &r.key)?
+                .as_ref()
+                .is_none_or(|old| newer(&r, old))
+            {
+                conn.execute(
+                    "INSERT OR REPLACE INTO webdav_records VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        r.kind,
+                        r.key,
+                        r.clock,
+                        r.nonce,
+                        r.deleted,
+                        r.data.to_string()
+                    ],
+                )?;
+                conn.execute(
+                    "UPDATE webdav_control SET clock=max(clock,?1) WHERE id=1",
+                    [r.clock],
+                )?;
+                conn.execute(
+                    "INSERT INTO webdav_changed VALUES(?1,?2)",
+                    params![r.kind, r.key],
+                )?;
+                changed += 1;
+            }
+            Ok(())
+        },
+    )?;
     if changed == 0 {
         return Ok(0);
     }
     conn.execute("UPDATE webdav_control SET paused=1 WHERE id=1", [])?;
-    for kind in ["folder"] {
-        let spec = specs.iter().find(|s| s.kind == kind).unwrap();
-        for r in merged.values().filter(|r| r.kind == kind && !r.deleted) {
-            let mut root = r.clone();
-            root.data["parent_id"] = Value::Null;
-            apply(conn, spec, &root)?;
-        }
-    }
+    let structural: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM webdav_changed WHERE kind IN ('feed','retention'))",
+        [],
+        |r| r.get(0),
+    )?;
+    let folder_spec = specs.iter().find(|s| s.kind == "folder").unwrap();
+    visit(
+        conn,
+        &format!("SELECT {RECORD_JSON} FROM webdav_records WHERE kind='folder' AND deleted=0"),
+        |mut r| {
+            r.data["parent_id"] = Value::Null;
+            apply(conn, folder_spec, &r)
+        },
+    )?;
     for spec in &specs {
-        let mut live: Vec<_> = merged
-            .values()
-            .filter(|r| r.kind == spec.kind && !r.deleted)
-            .collect();
-        if spec.kind == "tag" {
-            live.sort_by_key(|r| {
-                serde_json::from_str::<Vec<String>>(&r.key)
-                    .map(|p| p.len())
-                    .unwrap_or(0)
-            });
-        }
-        for r in live {
-            apply(conn, spec, r)?;
-        }
+        let order = if spec.kind == "tag" {
+            "json_array_length(key),key"
+        } else {
+            "key"
+        };
+        // Large, unchanged HTML is never re-imported or re-indexed on a flag edit.
+        let filter = if spec.kind == "article" && !structural {
+            " AND (key IN (SELECT key FROM webdav_changed WHERE kind='article') OR key IN (SELECT json_array(f.feed_url,a.guid) FROM articles a JOIN feeds f ON f.id=a.feed_id LEFT JOIN articles_fts x ON x.rowid=a.id WHERE x.rowid IS NULL))"
+        } else {
+            ""
+        };
+        visit(conn,&format!("SELECT {RECORD_JSON} FROM webdav_records WHERE kind='{}' AND deleted=0{filter} ORDER BY {order}",spec.kind),|r|apply(conn,spec,&r))?;
     }
-    // Children first, so deleting a renamed folder cannot delete/misplace its
-    // already-moved subscriptions. Cascade deletion handles dependent rows.
     for spec in specs.iter().rev().filter(|s| !s.state) {
-        let mut deleted: Vec<_> = merged
-            .values()
-            .filter(|r| r.kind == spec.kind && r.deleted)
-            .collect();
-        if spec.kind == "tag" {
-            deleted.sort_by_key(|r| {
-                std::cmp::Reverse(
-                    serde_json::from_str::<Vec<String>>(&r.key)
-                        .map(|p| p.len())
-                        .unwrap_or(0),
-                )
-            });
-        }
-        for r in deleted {
+        let order = if spec.kind == "tag" {
+            "json_array_length(key) DESC,key"
+        } else {
+            "key"
+        };
+        // Deletion only needs natural keys, never the retained article bodies.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT key FROM webdav_records WHERE kind=?1 AND deleted=1 ORDER BY {order}"
+        ))?;
+        let mut rows = stmt.query([spec.kind])?;
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
             if spec.kind == "tag" {
                 let id: Option<i64> = conn
                     .query_row(
                         &format!("SELECT t.id FROM tags t WHERE {}=?1", spec.key),
-                        [&r.key],
-                        |row| row.get(0),
+                        [&key],
+                        |r| r.get(0),
                     )
                     .optional()?;
                 if let Some(id) = id {
                     super::delete_tag_rows(conn, id)?;
                 }
-                continue;
+            } else {
+                conn.execute(
+                    &format!("DELETE FROM {} AS t WHERE {}=?1", spec.table, spec.key),
+                    [&key],
+                )?;
             }
-            conn.execute(
-                &format!(
-                    "DELETE FROM {table} AS t WHERE {key}=?1",
-                    table = spec.table,
-                    key = spec.key
-                ),
-                [&r.key],
-            )?;
         }
     }
     conn.execute_batch(&repair_tag_sql())?;
@@ -832,12 +925,17 @@ fn merge_rows(conn: &Connection, incoming: &[Record]) -> AppResult<usize> {
 
 fn apply(conn: &Connection, spec: &Spec, record: &Record) -> AppResult<()> {
     if spec.kind == "ai_prompt" {
-        return super::set_setting(conn, "ai_summary_prompt", record.data["prompt"].as_str().ok_or_else(invalid)?);
+        return super::set_setting(
+            conn,
+            "ai_summary_prompt",
+            record.data["prompt"].as_str().ok_or_else(invalid)?,
+        );
     }
     if spec.kind == "ai_config" {
         let provider = record.data["provider"].as_str().ok_or_else(invalid)?;
         let model = record.data["model"].as_str().ok_or_else(invalid)?;
-        let previous = super::get_setting(conn, "ai_provider")?.unwrap_or_else(|| "anthropic".into());
+        let previous =
+            super::get_setting(conn, "ai_provider")?.unwrap_or_else(|| "anthropic".into());
         // Endpoint profiles stay local, including URLs containing credentials.
         // On a remote provider switch, restore this device's matching endpoint.
         if previous != provider {
@@ -845,13 +943,18 @@ fn apply(conn: &Connection, spec: &Spec, record: &Record) -> AppResult<()> {
                 let value = super::get_setting(conn, key)?.unwrap_or_default();
                 super::set_setting(conn, &format!("{key}_{previous}"), &value)?;
             }
-            let endpoint = super::get_setting(conn, &format!("ai_base_url_{provider}"))?.unwrap_or_default();
+            let endpoint =
+                super::get_setting(conn, &format!("ai_base_url_{provider}"))?.unwrap_or_default();
             super::set_setting(conn, "ai_base_url", &endpoint)?;
         }
         super::set_setting(conn, "ai_provider", provider)?;
         super::set_setting(conn, "ai_model", model)?;
         super::set_setting(conn, &format!("ai_model_{provider}"), model)?;
-        return super::set_setting(conn, "ai_reasoning_effort_codex", record.data["effort"].as_str().ok_or_else(invalid)?);
+        return super::set_setting(
+            conn,
+            "ai_reasoning_effort_codex",
+            record.data["effort"].as_str().ok_or_else(invalid)?,
+        );
     }
     let mut data = record.data.clone();
     if spec.kind == "article" {
@@ -1056,77 +1159,76 @@ pub fn merge_remote(conn: &mut Connection, incoming: &[Record]) -> AppResult<usi
     tx.commit()?;
     Ok(changed)
 }
+/// Atomically review/import the on-disk remote snapshot.
+pub fn merge_staged(conn: &mut Connection) -> AppResult<usize> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if detect_table(&tx, "webdav_incoming")? > 0 {
+        tx.commit()?;
+        return Err(AppError::code("webdavNeedsResolution"));
+    }
+    let changed = merge_table(&tx, "webdav_incoming")?;
+    tx.execute(
+        "UPDATE webdav_incoming_chunks SET dirty=0 WHERE dirty=1",
+        [],
+    )?;
+    tx.execute("DELETE FROM webdav_baseline", [])?;
+    tx.execute(
+        "INSERT INTO webdav_baseline SELECT * FROM webdav_observed",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(changed)
+}
+
 fn detect_rows(conn: &Connection, incoming: &[Record]) -> AppResult<usize> {
+    stage_slice(conn, incoming)?;
+    detect_table(conn, "webdav_input")
+}
+
+fn detect_table(conn: &Connection, table: &str) -> AppResult<usize> {
     let specs = current_specs();
-    let incoming: Vec<_> = incoming.iter().cloned().map(normalized).collect();
-    for r in &incoming {
-        validate(
-            r,
-            specs
-                .iter()
-                .find(|s| s.kind == r.kind)
-                .ok_or_else(invalid)?,
-        )?;
-    }
-    if let Some(clock) = incoming.iter().map(|r| r.clock).max() {
-        conn.execute(
-            "UPDATE webdav_control SET clock=max(clock,?1) WHERE id=1",
-            [clock],
-        )?;
-    }
     conn.execute("DELETE FROM webdav_observed", [])?;
-    for r in &incoming {
-        conn.execute(
-            "INSERT INTO webdav_observed VALUES(?1,?2,?3)",
-            params![
-                r.kind,
-                r.key,
-                serde_json::to_string(r).map_err(|_| invalid())?
-            ],
-        )?;
-    }
-    let local: std::collections::BTreeMap<_, _> = records(conn)?
-        .into_iter()
-        .map(|r| ((r.kind.clone(), r.key.clone()), r))
-        .collect();
     conn.execute("DELETE FROM webdav_conflicts", [])?;
-    for r in &incoming {
-        if ["article", "enclosure", "retention"].contains(&r.kind.as_str()) {
-            continue;
-        }
-        let key = (r.kind.clone(), r.key.clone());
-        let Some(l) = local.get(&key) else {
-            continue;
-        };
-        if same_value(l, r) {
-            continue;
-        }
-        let base: Option<String> = conn
-            .query_row(
-                "SELECT record FROM webdav_baseline WHERE kind=?1 AND key=?2",
-                params![r.kind, r.key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let both_changed = if let Some(base) = base {
-            let base: Record = normalized(serde_json::from_str(&base).map_err(|_| invalid())?);
-            !same_revision(l, &base) && !same_revision(r, &base)
-        } else {
-            l.clock > 0 && r.clock > 0 && !l.nonce.is_empty() && !r.nonce.is_empty()
-        };
-        if both_changed {
-            store_conflict(conn, l, r, "concurrent")?;
-        }
-    }
+    visit(conn,&format!("SELECT record FROM {table} WHERE kind NOT IN ('article','enclosure','retention') ORDER BY kind,key"),|r| {
+        validate(&r,specs.iter().find(|s|s.kind==r.kind).ok_or_else(invalid)?)?;
+        conn.execute("UPDATE webdav_control SET clock=max(clock,?1) WHERE id=1",[r.clock])?;
+        // Article content is automatically reconciled: only revisions needed
+        // for user conflict review are retained as a baseline.
+        conn.execute("INSERT INTO webdav_observed VALUES(?1,?2,?3)",params![r.kind,r.key,serde_json::to_string(&r).map_err(|_|invalid())?])?;
+        let Some(l)=lookup(conn,&r.kind,&r.key)? else { return Ok(()); };
+        if same_value(&l,&r) { return Ok(()); }
+        let base:Option<String>=conn.query_row("SELECT record FROM webdav_baseline WHERE kind=?1 AND key=?2",params![r.kind,r.key],|row|row.get(0)).optional()?;
+        let both_changed=if let Some(base)=base {
+            let base=normalized(serde_json::from_str(&base).map_err(|_|invalid())?);
+            !same_revision(&l,&base)&&!same_revision(&r,&base)
+        } else {l.clock>0&&r.clock>0&&!l.nonce.is_empty()&&!r.nonce.is_empty()};
+        if both_changed { store_conflict(conn,&l,&r,"concurrent")?; }
+        Ok(())
+    })?;
+    // Only hierarchy metadata needs a combined graph in memory.
+    let mut local = std::collections::BTreeMap::new();
+    visit(
+        conn,
+        &format!("SELECT {RECORD_JSON} FROM webdav_records WHERE kind IN ('tag','folder')"),
+        |r| {
+            local.insert((r.kind.clone(), r.key.clone()), r);
+            Ok(())
+        },
+    )?;
     // Different concurrent moves can form a cycle even when their keys differ.
     // Stop before applying any remote rows and offer moving an edge to root.
     let mut combined = local.clone();
-    for r in &incoming {
-        let k = (r.kind.clone(), r.key.clone());
-        if combined.get(&k).is_none_or(|l| newer(r, l)) {
-            combined.insert(k, r.clone());
-        }
-    }
+    visit(
+        conn,
+        &format!("SELECT record FROM {table} WHERE kind IN ('tag','folder')"),
+        |r| {
+            let k = (r.kind.clone(), r.key.clone());
+            if combined.get(&k).is_none_or(|l| newer(&r, l)) {
+                combined.insert(k, r);
+            }
+            Ok(())
+        },
+    )?;
     for r in combined.values().filter(|r| r.kind == "tag" && !r.deleted) {
         if let Some(parent) = r.data["parent_id"].as_str() {
             if combined
@@ -1185,7 +1287,10 @@ pub fn acknowledge(conn: &Connection, snapshot: &[Record]) -> AppResult<()> {
 }
 fn acknowledge_rows(conn: &Connection, snapshot: &[Record]) -> AppResult<()> {
     conn.execute("DELETE FROM webdav_baseline", [])?;
-    for r in snapshot {
+    for r in snapshot
+        .iter()
+        .filter(|r| !["article", "enclosure", "retention"].contains(&r.kind.as_str()))
+    {
         conn.execute(
             "INSERT INTO webdav_baseline VALUES(?1,?2,?3)",
             params![
@@ -1208,9 +1313,7 @@ pub fn resolve_conflict(
         .into_iter()
         .find(|c| c.kind == kind && c.key == key)
         .ok_or_else(|| AppError::code("webdavConflictGone"))?;
-    let current = records(&tx)?
-        .into_iter()
-        .find(|r| r.kind == kind && r.key == key);
+    let current = lookup(&tx, kind, key)?;
     if current
         .as_ref()
         .is_some_and(|r| !same_revision(r, &c.local))
@@ -1457,7 +1560,12 @@ mod tests {
         let a = database();
         fixture(&a, 0);
         crate::db::set_setting(&a, "ai_api_key", "SECRET_API_KEY").unwrap();
-        crate::db::set_setting(&a, "ai_base_url", "https://SECRET:SECRET@example.com/v1?token=SECRET").unwrap();
+        crate::db::set_setting(
+            &a,
+            "ai_base_url",
+            "https://SECRET:SECRET@example.com/v1?token=SECRET",
+        )
+        .unwrap();
         crate::db::set_setting(&a, "ai_base_url_openai", "SECRET_PROFILE_ENDPOINT").unwrap();
         crate::db::set_setting(&a, "codex_auth", "SECRET_AUTH").unwrap();
         crate::db::set_setting(&a, "webdav_password", "SECRET_DAV_PASSWORD").unwrap();
@@ -1473,7 +1581,8 @@ mod tests {
     #[test]
     fn ai_preferences_bootstrap_reset_and_local_endpoints() {
         use crate::db::{configure_ai_selection, get_setting, set_setting};
-        let mut a = database(); let mut b = database();
+        let mut a = database();
+        let mut b = database();
         configure_ai_selection(&a, "codex", Some("selected-model"), None, Some("high")).unwrap();
         set_setting(&a, "ai_summary_prompt", "写成清晰的短段落，并保留原图。").unwrap();
         set_setting(&b, "ai_api_key", "LOCAL_KEY").unwrap();
@@ -1482,84 +1591,165 @@ mod tests {
         // A fresh device's defaults must not overwrite a configured one.
         assert_eq!(detect_conflicts(&a, &records(&b).unwrap()).unwrap(), 0);
         merge_remote(&mut a, &records(&b).unwrap()).unwrap();
-        assert_eq!(get_setting(&a, "ai_model").unwrap().as_deref(), Some("selected-model"));
+        assert_eq!(
+            get_setting(&a, "ai_model").unwrap().as_deref(),
+            Some("selected-model")
+        );
         merge_remote(&mut b, &records(&a).unwrap()).unwrap();
-        for key in ["ai_provider", "ai_model", "ai_reasoning_effort_codex", "ai_summary_prompt"] {
+        for key in [
+            "ai_provider",
+            "ai_model",
+            "ai_reasoning_effort_codex",
+            "ai_summary_prompt",
+        ] {
             assert_eq!(get_setting(&a, key).unwrap(), get_setting(&b, key).unwrap());
         }
-        assert_eq!(get_setting(&b,"ai_api_key").unwrap().as_deref(),Some("LOCAL_KEY"));
-        assert_eq!(get_setting(&b,"ai_base_url").unwrap().as_deref(),Some("https://local-codex/v1"));
-        assert_eq!(get_setting(&b,"ai_base_url_anthropic").unwrap().as_deref(),Some("https://local-anthropic/v1"));
+        assert_eq!(
+            get_setting(&b, "ai_api_key").unwrap().as_deref(),
+            Some("LOCAL_KEY")
+        );
+        assert_eq!(
+            get_setting(&b, "ai_base_url").unwrap().as_deref(),
+            Some("https://local-codex/v1")
+        );
+        assert_eq!(
+            get_setting(&b, "ai_base_url_anthropic").unwrap().as_deref(),
+            Some("https://local-anthropic/v1")
+        );
         // Default selection and restoring the default prompt are real edits.
         configure_ai_selection(&a, "codex", Some(""), None, Some("")).unwrap();
         set_setting(&a, "ai_summary_prompt", "").unwrap();
-        merge_remote(&mut b,&records(&a).unwrap()).unwrap();
-        for key in ["ai_model","ai_reasoning_effort_codex","ai_summary_prompt"] {
-            assert_eq!(get_setting(&b,key).unwrap().as_deref(),Some(""));
+        merge_remote(&mut b, &records(&a).unwrap()).unwrap();
+        for key in ["ai_model", "ai_reasoning_effort_codex", "ai_summary_prompt"] {
+            assert_eq!(get_setting(&b, key).unwrap().as_deref(), Some(""));
         }
     }
     #[test]
     fn ai_independent_edits_merge_and_same_record_conflicts_resolve() {
         use crate::db::{configure_ai_selection, get_setting, set_setting};
-        let mut a=database(); let mut b=database();
-        configure_ai_selection(&a,"codex",Some("model-one"),None,Some("low")).unwrap();
-        set_setting(&a,"ai_summary_prompt","Original prompt").unwrap();
-        merge_remote(&mut b,&records(&a).unwrap()).unwrap();
-        acknowledge(&a,&records(&a).unwrap()).unwrap();
-        configure_ai_selection(&a,"codex",Some("model-two"),None,Some("high")).unwrap();
-        set_setting(&b,"ai_summary_prompt","Revised prompt").unwrap();
-        merge_remote(&mut a,&records(&b).unwrap()).unwrap();
-        merge_remote(&mut b,&records(&a).unwrap()).unwrap();
-        assert_eq!(get_setting(&b,"ai_model").unwrap().as_deref(),Some("model-two"));
-        assert_eq!(get_setting(&a,"ai_summary_prompt").unwrap().as_deref(),Some("Revised prompt"));
-        acknowledge(&a,&records(&a).unwrap()).unwrap();
-        configure_ai_selection(&a,"codex",Some("left"),None,Some("low")).unwrap();
-        configure_ai_selection(&b,"openai",Some("right"),None,Some("high")).unwrap();
-        set_setting(&a,"ai_summary_prompt","Left prompt").unwrap();
-        set_setting(&b,"ai_summary_prompt","Right prompt").unwrap();
-        let remote=records(&b).unwrap();
-        acknowledge(&b,&remote).unwrap(); // B successfully uploaded this snapshot.
-        assert!(merge_remote(&mut a,&remote).is_err());
-        assert_eq!(conflicts(&a).unwrap().len(),2);
-        assert_eq!(get_setting(&a,"ai_model").unwrap().as_deref(),Some("left"));
-        resolve_conflict(&mut a,"ai_config","selection","remote").unwrap();
-        resolve_conflict(&mut a,"ai_prompt","summary","local").unwrap();
-        merge_remote(&mut a,&remote).unwrap();
-        merge_remote(&mut b,&records(&a).unwrap()).unwrap();
-        assert_eq!(get_setting(&a,"ai_provider").unwrap().as_deref(),Some("openai"));
-        assert_eq!(get_setting(&a,"ai_model").unwrap().as_deref(),Some("right"));
-        assert_eq!(get_setting(&a,"ai_reasoning_effort_codex").unwrap().as_deref(),Some("high"));
-        assert_eq!(get_setting(&b,"ai_summary_prompt").unwrap().as_deref(),Some("Left prompt"));
-        assert_eq!(records(&a).unwrap(),records(&b).unwrap());
+        let mut a = database();
+        let mut b = database();
+        configure_ai_selection(&a, "codex", Some("model-one"), None, Some("low")).unwrap();
+        set_setting(&a, "ai_summary_prompt", "Original prompt").unwrap();
+        merge_remote(&mut b, &records(&a).unwrap()).unwrap();
+        acknowledge(&a, &records(&a).unwrap()).unwrap();
+        configure_ai_selection(&a, "codex", Some("model-two"), None, Some("high")).unwrap();
+        set_setting(&b, "ai_summary_prompt", "Revised prompt").unwrap();
+        merge_remote(&mut a, &records(&b).unwrap()).unwrap();
+        merge_remote(&mut b, &records(&a).unwrap()).unwrap();
+        assert_eq!(
+            get_setting(&b, "ai_model").unwrap().as_deref(),
+            Some("model-two")
+        );
+        assert_eq!(
+            get_setting(&a, "ai_summary_prompt").unwrap().as_deref(),
+            Some("Revised prompt")
+        );
+        acknowledge(&a, &records(&a).unwrap()).unwrap();
+        configure_ai_selection(&a, "codex", Some("left"), None, Some("low")).unwrap();
+        configure_ai_selection(&b, "openai", Some("right"), None, Some("high")).unwrap();
+        set_setting(&a, "ai_summary_prompt", "Left prompt").unwrap();
+        set_setting(&b, "ai_summary_prompt", "Right prompt").unwrap();
+        let remote = records(&b).unwrap();
+        acknowledge(&b, &remote).unwrap(); // B successfully uploaded this snapshot.
+        assert!(merge_remote(&mut a, &remote).is_err());
+        assert_eq!(conflicts(&a).unwrap().len(), 2);
+        assert_eq!(
+            get_setting(&a, "ai_model").unwrap().as_deref(),
+            Some("left")
+        );
+        resolve_conflict(&mut a, "ai_config", "selection", "remote").unwrap();
+        resolve_conflict(&mut a, "ai_prompt", "summary", "local").unwrap();
+        merge_remote(&mut a, &remote).unwrap();
+        merge_remote(&mut b, &records(&a).unwrap()).unwrap();
+        assert_eq!(
+            get_setting(&a, "ai_provider").unwrap().as_deref(),
+            Some("openai")
+        );
+        assert_eq!(
+            get_setting(&a, "ai_model").unwrap().as_deref(),
+            Some("right")
+        );
+        assert_eq!(
+            get_setting(&a, "ai_reasoning_effort_codex")
+                .unwrap()
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            get_setting(&b, "ai_summary_prompt").unwrap().as_deref(),
+            Some("Left prompt")
+        );
+        assert_eq!(records(&a).unwrap(), records(&b).unwrap());
     }
     #[test]
     fn ai_payload_allowlist_rejects_secret_injection_and_invalid_values() {
-        let a=database(); let mut b=database();
-        let original=records(&b).unwrap();
-        let config=records(&a).unwrap().into_iter().find(|r|r.kind=="ai_config").unwrap();
-        for (field,value) in [("api_key",serde_json::json!("secret")),("provider",serde_json::json!("unknown")),("effort",serde_json::json!("bad")),("model",Value::Null)] {
-            let mut bad=config.clone(); bad.data[field]=value; bad.clock=100;
-            assert!(merge_remote(&mut b,&[bad]).is_err());
+        let a = database();
+        let mut b = database();
+        let original = records(&b).unwrap();
+        let config = records(&a)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == "ai_config")
+            .unwrap();
+        for (field, value) in [
+            ("api_key", serde_json::json!("secret")),
+            ("provider", serde_json::json!("unknown")),
+            ("effort", serde_json::json!("bad")),
+            ("model", Value::Null),
+        ] {
+            let mut bad = config.clone();
+            bad.data[field] = value;
+            bad.clock = 100;
+            assert!(merge_remote(&mut b, &[bad]).is_err());
         }
-        let mut bad=config.clone(); bad.key="ai_api_key".into(); assert!(merge_remote(&mut b,&[bad]).is_err());
-        let mut bad=config; bad.deleted=true; assert!(merge_remote(&mut b,&[bad]).is_err());
-        let mut bad=records(&a).unwrap().into_iter().find(|r|r.kind=="ai_prompt").unwrap();
-        bad.data["prompt"]=Value::String("字".repeat(12001)); assert!(merge_remote(&mut b,&[bad]).is_err());
-        assert_eq!(records(&b).unwrap(),original);
+        let mut bad = config.clone();
+        bad.key = "ai_api_key".into();
+        assert!(merge_remote(&mut b, &[bad]).is_err());
+        let mut bad = config;
+        bad.deleted = true;
+        assert!(merge_remote(&mut b, &[bad]).is_err());
+        let mut bad = records(&a)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == "ai_prompt")
+            .unwrap();
+        bad.data["prompt"] = Value::String("字".repeat(12001));
+        assert!(merge_remote(&mut b, &[bad]).is_err());
+        assert_eq!(records(&b).unwrap(), original);
     }
     #[test]
     fn deleting_preferences_tracks_defaults_and_profile_write_is_atomic() {
-        let a=database();
-        crate::db::configure_ai_selection(&a,"codex",Some("model"),None,Some("high")).unwrap();
-        let config=records(&a).unwrap().into_iter().find(|r|r.kind=="ai_config").unwrap();
-        assert_eq!(config.data,serde_json::json!({"provider":"codex","model":"model","effort":"high"}));
-        crate::db::set_setting(&a,"ai_summary_prompt","Custom").unwrap();
-        a.execute("DELETE FROM settings",[]).unwrap();
-        let config=records(&a).unwrap().into_iter().find(|r|r.kind=="ai_config").unwrap();
-        assert_eq!(config.data,serde_json::json!({"provider":"anthropic","model":"","effort":""}));
+        let a = database();
+        crate::db::configure_ai_selection(&a, "codex", Some("model"), None, Some("high")).unwrap();
+        let config = records(&a)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == "ai_config")
+            .unwrap();
+        assert_eq!(
+            config.data,
+            serde_json::json!({"provider":"codex","model":"model","effort":"high"})
+        );
+        crate::db::set_setting(&a, "ai_summary_prompt", "Custom").unwrap();
+        a.execute("DELETE FROM settings", []).unwrap();
+        let config = records(&a)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == "ai_config")
+            .unwrap();
+        assert_eq!(
+            config.data,
+            serde_json::json!({"provider":"anthropic","model":"","effort":""})
+        );
         assert!(!config.deleted);
-        let prompt=records(&a).unwrap().into_iter().find(|r|r.kind=="ai_prompt").unwrap();
-        assert_eq!(prompt.data["prompt"],""); assert!(prompt.clock>0);
+        let prompt = records(&a)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == "ai_prompt")
+            .unwrap();
+        assert_eq!(prompt.data["prompt"], "");
+        assert!(prompt.clock > 0);
     }
     #[test]
     fn retention_and_deletions_survive_round_trip() {

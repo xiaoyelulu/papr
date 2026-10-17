@@ -29,3 +29,6 @@ lol_html.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+flate2 = "1"
+sha2 = "0.10"

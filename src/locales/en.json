@@ -553,7 +553,7 @@
       "creditsThanks": "Thanks to everyone who maintains open standards — RSS keeps independent writing reachable."
     },
     "webdav": {
-      "hint": "Sync your library, nested folders and tags, reading progress, read status, stars, read-later, highlights and notes across devices. Concurrent edits are reviewed below. Credentials stay local. Saved summary prompts, AI provider, model and reasoning effort sync through WebDAV. API keys, ChatGPT sign-in and custom endpoints stay on this device.",
+      "hint": "Sync your library, nested folders and tags, reading progress, read status, stars, read-later, highlights and notes across devices. Concurrent edits are reviewed below. Credentials stay local. Saved summary prompts, AI provider, model and reasoning effort sync through WebDAV. API keys, ChatGPT sign-in and custom endpoints stay on this device. Compressed chunks and incremental transfers support large libraries. The first sync transfers all content; keep the app open and allow local storage for sync staging. Update every device before syncing.",
       "url": "WebDAV directory URL (https://example.com/dav/papr/)",
       "lastSync": "Last synced: {{time}}",
       "neverSynced": "Connected. Choose Sync now to merge your library.",
@@ -721,7 +721,7 @@
     "webdavInvalidUrl": "Enter an HTTP(S) directory URL without embedded credentials, query parameters or a fragment.",
     "webdavAuthFailed": "WebDAV authentication failed. Check the username and password.",
     "webdavEtagRequired": "This WebDAV server does not provide strong ETags. Safe multi-device sync is unavailable.",
-    "webdavTooLarge": "The WebDAV library exceeds the 128 MiB sync limit.",
+    "webdavTooLarge": "A single sync record exceeds 64 MiB, or the manifest is too large. There is no 128 MiB limit on the whole library.",
     "webdavInvalidData": "The WebDAV library file is invalid. Local data was not replaced.",
     "webdavVersion": "This WebDAV library was created by an unsupported protocol version. Update Papr.",
     "webdavNotConnected": "Connect a WebDAV server first.",

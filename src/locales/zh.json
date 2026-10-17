@@ -553,7 +553,7 @@
       "creditsThanks": "感谢所有维护开放标准的人 — RSS 让独立写作仍然可达。"
     },
     "webdav": {
-      "hint": "跨设备同步文献库、多级文件夹与标签、阅读进度、已读状态、星标、稍后读、高亮和笔记。并发修改可在下方处理冲突，凭据仅保存在本机。 已保存的摘要提示词、AI 服务商、模型与思考强度会随 WebDAV 同步。API Key、ChatGPT 登录和自定义接口地址仅保存在本机。",
+      "hint": "跨设备同步文献库、多级文件夹与标签、阅读进度、已读状态、星标、稍后读、高亮和笔记。并发修改可在下方处理冲突，凭据仅保存在本机。 已保存的摘要提示词、AI 服务商、模型与思考强度会随 WebDAV 同步。API Key、ChatGPT 登录和自定义接口地址仅保存在本机。 同步采用压缩分块和增量传输，支持大型文章库；首次同步需上传全文，请保持应用在前台并预留本机存储空间。请先升级所有设备再同步。",
       "url": "WebDAV 目录地址（https://example.com/dav/papr/）",
       "lastSync": "上次同步：{{time}}",
       "neverSynced": "已连接。点击“立即同步”合并文章库。",
@@ -721,7 +721,7 @@
     "webdavInvalidUrl": "请输入 HTTP(S) 目录地址，不要在地址中包含账号密码、查询参数或片段。",
     "webdavAuthFailed": "WebDAV 验证失败，请检查用户名和密码。",
     "webdavEtagRequired": "此 WebDAV 服务未提供强 ETag，无法安全地进行多设备同步。",
-    "webdavTooLarge": "WebDAV 文章库超过了 128 MiB 的同步上限。",
+    "webdavTooLarge": "单条同步记录超过 64 MiB，或同步清单过大；文章库总大小没有 128 MiB 限制。",
     "webdavInvalidData": "WebDAV 文章库文件格式无效，本机数据未被替换。",
     "webdavVersion": "此 WebDAV 文章库使用了不支持的协议版本，请升级 Papr。",
     "webdavNotConnected": "请先连接 WebDAV 服务。",
