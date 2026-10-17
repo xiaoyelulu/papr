@@ -448,14 +448,8 @@ async fn execute_inner(
     // representation without changing v7 semantics. Verify a NEW strong ETag
     // before deleting anything; an old If-Match must now fail on the server.
     lock.refresh(http, c).await?;
-    let mut fenced = serde_json::to_vec(&manifest).map_err(|_| inventory::invalid())?;
     let nonce = replication::probe_id(&*db.lock().await)?;
-    fenced.push(b'\n');
-    for b in nonce.bytes() {
-        for bit in 0..8 {
-            fenced.push(if b & (1 << bit) == 0 { b' ' } else { b'\t' });
-        }
-    }
+    let fenced = fenced_body(&manifest, &nonce)?;
     put_locked(http, c, lock, FILE, Some(&etag), fenced).await?;
     let (root, after) = download(http, c).await?;
     if after.as_deref() == Some(&etag) || !matches!(root,Root::Manifest(m) if m==manifest) {
@@ -610,5 +604,51 @@ pub(super) async fn session_end(http: &Client, c: &Credentials, name: &str) {
         .await
     {
         transport::drain(r).await;
+    }
+}
+
+fn fenced_body(manifest: &chunks::Manifest, nonce: &str) -> AppResult<Vec<u8>> {
+    let mut body = serde_json::to_vec(manifest).map_err(|_| inventory::invalid())?;
+    let extra = 1 + nonce.len().saturating_mul(8);
+    if body.len().saturating_add(extra) > 16 * 1024 * 1024 {
+        return Err(AppError::code("webdavTooLarge"));
+    }
+    body.push(b'\n');
+    for b in nonce.bytes() {
+        for bit in 0..8 {
+            body.push(if b & (1 << bit) == 0 { b' ' } else { b'\t' });
+        }
+    }
+    Ok(body)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fence_refuses_to_make_a_valid_near_limit_manifest_unreadable() {
+        let mut manifest = chunks::Manifest::empty();
+        let part = chunks::Part {
+            hash: "0".repeat(64),
+            kind: "article".into(),
+            bucket: 0,
+            bytes: 1,
+            raw_bytes: 1,
+            records: 1,
+        };
+        let base = serde_json::to_vec(&manifest).unwrap().len();
+        let each = serde_json::to_vec(&part).unwrap().len() + 1;
+        let count = (16 * 1024 * 1024 - base + 1) / each;
+        manifest.chunks = (0..count)
+            .map(|i| chunks::Part {
+                hash: format!("{i:064x}"),
+                ..part.clone()
+            })
+            .collect();
+        manifest.validate().unwrap();
+        assert!(serde_json::to_vec(&manifest).unwrap().len() <= 16 * 1024 * 1024);
+        assert!(matches!(
+            fenced_body(&manifest, &"a".repeat(32)),
+            Err(AppError::Coded("webdavTooLarge"))
+        ));
     }
 }
