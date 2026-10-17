@@ -1419,8 +1419,23 @@ pub async fn webdav_conflicts(state: State<'_, AppState>) -> AppResult<Vec<db::w
 pub async fn webdav_resolve(state: State<'_, AppState>, kind:String, key:String, choice:String) -> AppResult<()> { papr_core::webdav::resolve(&state.db,&kind,&key,&choice).await }
 
 #[tauri::command]
-pub async fn webdav_connect(state: State<'_, AppState>, url: String, username: String, password: String) -> AppResult<()> {
-    papr_core::webdav::connect(&state.db, &state.http(), &url, &username, &password).await
+pub async fn webdav_connect(state: State<'_, AppState>, url: String, username: String, password: String, directory:Option<String>) -> AppResult<()> {
+    let url=papr_core::webdav::directory_url(&url,directory.as_deref().unwrap_or(""))?;
+    let client=papr_core::webdav::http_client(&*state.db.lock().await)?;
+    papr_core::webdav::connect(&state.db, &client, &url, &username, &password).await
+}
+#[tauri::command]
+pub fn webdav_progress()->papr_core::webdav::Progress {papr_core::webdav::progress()}
+#[tauri::command]
+pub fn webdav_cancel(){papr_core::webdav::cancel();}
+#[tauri::command]
+pub async fn webdav_network_options(state:State<'_,AppState>)->AppResult<papr_core::webdav::NetworkOptions>{papr_core::webdav::NetworkOptions::read(&*state.read().await)}
+#[tauri::command]
+pub async fn webdav_save_network(state:State<'_,AppState>,options:papr_core::webdav::NetworkOptions)->AppResult<()> {options.save(&*state.db.lock().await)}
+#[tauri::command]
+pub async fn webdav_relocate(state:State<'_,AppState>,directory:String)->AppResult<String> {
+    let client=papr_core::webdav::http_client(&*state.db.lock().await)?;
+    papr_core::webdav::relocate(&state.db,&client,&directory).await
 }
 
 #[tauri::command]
@@ -1431,7 +1446,8 @@ pub async fn webdav_disconnect(state: State<'_, AppState>) -> AppResult<()> {
 #[tauri::command]
 pub async fn webdav_sync(app: AppHandle) -> AppResult<usize> {
     let state = app.state::<AppState>();
-    let result = papr_core::webdav::sync_now(&state.db, &state.http()).await;
+    let client=papr_core::webdav::http_client(&*state.db.lock().await)?;
+    let result = papr_core::webdav::sync_now(&state.db, &client).await;
     // A failed upload may still have imported remote edits.
     let _ = app.emit("feeds-updated", 0);
     let _ = app.emit("webdav-updated", ());

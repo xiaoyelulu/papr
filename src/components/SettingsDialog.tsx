@@ -1085,6 +1085,9 @@ function WebDavSection({ onToast }: { onToast: (m: string) => void }) {
   const qc = useQueryClient();
   const actions = useArticleActions();
   const status = useQuery({ queryKey: ["webdav-status"], queryFn: api.webdavStatus, refetchInterval: 15_000 });
+  const transfer = useQuery({ queryKey: ["webdav-progress"], queryFn: api.webdavProgress, refetchInterval: (query) => query.state.data?.running ? 750 : 2500 });
+  const [directory, setDirectory] = useState("Papr");
+  const [directoryTarget, setDirectoryTarget] = useState("");
   const conflicts = useQuery({ queryKey: ["webdav-conflicts"], queryFn: api.webdavConflicts, refetchInterval: 15_000 });
   const resolve = async (c: api.WebDavConflict, choice: "local" | "remote" | "newer" | "root") => {
     setBusy(true);
@@ -1106,28 +1109,34 @@ function WebDavSection({ onToast }: { onToast: (m: string) => void }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
-  const [operation, setOperation] = useState<"connect" | "sync" | "disconnect" | null>(null);
-  const run = async (operation: "connect" | "sync" | "disconnect") => {
+  const [operation, setOperation] = useState<"connect" | "sync" | "disconnect" | "relocate" | null>(null);
+  const active = busy || !!transfer.data?.running;
+  const run = async (operation: "connect" | "sync" | "disconnect" | "relocate") => {
     setBusy(true);
     setOperation(operation);
     try {
       if (operation === "connect") {
-        await api.webdavConnect(url.trim(), username.trim(), password);
+        await api.webdavConnect(url.trim(), username.trim(), password, directory.trim());
         setPassword("");
         onToast(t("settings.sync.connected"));
       } else if (operation === "disconnect") {
         await api.webdavDisconnect();
         onToast(t("settings.sync.disconnected"));
+      } else if (operation === "relocate") {
+        const target = await api.webdavRelocate(directoryTarget.trim());
+        setDirectoryTarget(""); onToast(t("settings.webdav.directoryChanged", { path: target }));
       } else {
         await api.webdavSync();
         onToast(t("settings.webdav.done"));
       }
     } catch (e) {
-      reportError(e);
+      if (e && typeof e === "object" && "code" in e && e.code === "webdavCancelled") onToast(t("error.webdavCancelled"));
+      else reportError(e);
     } finally {
+      await qc.invalidateQueries({ queryKey: ["webdav-progress"] });
       await qc.invalidateQueries({ queryKey: ["webdav-status"] });
       await qc.invalidateQueries({ queryKey: ["webdav-conflicts"] });
-      if (operation === "sync") actions.refreshAfterFetch();
+      if (operation === "sync" || operation === "relocate") actions.refreshAfterFetch();
       setBusy(false);
       setOperation(null);
     }
@@ -1135,7 +1144,15 @@ function WebDavSection({ onToast }: { onToast: (m: string) => void }) {
   return (
     <div className="settings-group">
       <h3 className="settings-group-title">WebDAV</h3>
-      <p className="modal-hint" style={{ marginBottom: 14 }}>{t("settings.webdav.hint")}</p>
+      <details className="webdav-help"><summary>{t("settings.webdav.scopeHelp")}</summary><p className="modal-hint">{t("settings.webdav.hint")}</p></details>
+      <WebDavNetworkControls disabled={active} onToast={onToast} />
+      {transfer.data && (transfer.data.running || transfer.data.phase) && <div className="webdav-progress" role="status" aria-live="polite">
+        <strong>{t(`settings.webdav.phases.${transfer.data.phase}`, { defaultValue: transfer.data.phase })}</strong>
+        {transfer.data.total > 0 && <><progress max={transfer.data.total} value={transfer.data.completed} aria-label={t("settings.webdav.chunkProgress")} /><span>{transfer.data.completed} / {transfer.data.total}</span></>}
+        <p>{t("settings.webdav.transferBytes", { down: formatBytes(transfer.data.downloaded), up: formatBytes(transfer.data.uploaded) })}{transfer.data.running && transfer.data.bytesPerSecond > 0 ? ` · ${formatBytes(transfer.data.bytesPerSecond)}/s` : ""}</p>
+        {transfer.data.retries > 0 && <p>{t("settings.webdav.retryCount", { count: transfer.data.retries })}</p>}
+        {transfer.data.running && <button className="s-btn" onClick={() => { void api.webdavCancel().catch(reportError); }}>{t("settings.webdav.cancelTransfer")}</button>}
+      </div>}
       {status.isError && <p role="alert" className="modal-hint">{errorText(status.error)}</p>}
       {status.data?.connected ? (
         <>
@@ -1158,34 +1175,74 @@ function WebDavSection({ onToast }: { onToast: (m: string) => void }) {
                 {(["local", "remote"] as const).map((side) => <div key={side}><span>{t(`settings.webdav.${side}`)}</span><pre>{versionText(c[side])}</pre></div>)}
               </div>
               <div className="codex-actions">
-                <button className="s-btn" disabled={busy} onClick={() => { void resolve(c, "local"); }}>{t("settings.webdav.keepLocal")}</button>
-                <button className="s-btn" disabled={busy} onClick={() => { void resolve(c, "remote"); }}>{t("settings.webdav.keepRemote")}</button>
-                {["cycle", "missingParent"].includes(c.reason) ? <button className="s-btn" disabled={busy} onClick={() => { void resolve(c, "root"); }}>{t("settings.webdav.moveRoot")}</button> : <button className="s-btn" disabled={busy} onClick={() => { void resolve(c, "newer"); }}>{t("settings.webdav.keepNewer")}</button>}
+                <button className="s-btn" disabled={active} onClick={() => { void resolve(c, "local"); }}>{t("settings.webdav.keepLocal")}</button>
+                <button className="s-btn" disabled={active} onClick={() => { void resolve(c, "remote"); }}>{t("settings.webdav.keepRemote")}</button>
+                {["cycle", "missingParent"].includes(c.reason) ? <button className="s-btn" disabled={active} onClick={() => { void resolve(c, "root"); }}>{t("settings.webdav.moveRoot")}</button> : <button className="s-btn" disabled={active} onClick={() => { void resolve(c, "newer"); }}>{t("settings.webdav.keepNewer")}</button>}
               </div>
             </div>)}
           </div>}
-          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <button className="s-btn primary" disabled={busy} onClick={() => run("sync")}>
+          <div className="webdav-directory">
+            <label htmlFor="webdav-new-directory">{t("settings.webdav.newDirectory")}</label>
+            <input id="webdav-new-directory" className="modal-input" disabled={active} value={directoryTarget} onChange={(e) => setDirectoryTarget(e.target.value)} placeholder="Papr" {...NO_AUTOCORRECT} />
+            <p className="modal-hint">{t("settings.webdav.relocateHint")}</p>
+            {directoryTarget.trim() && <p className="webdav-path">{`${status.data.url}${encodeURIComponent(directoryTarget.trim())}/`}</p>}
+            <button className="s-btn" disabled={active || !directoryTarget.trim()} onClick={() => { void run("relocate"); }}>{operation === "relocate" ? t("settings.webdav.phases.relocating") : t("settings.webdav.createDirectory")}</button>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
+            <button className="s-btn primary" disabled={active} onClick={() => run("sync")}>
               <Icon name="refresh" size={12} /> {operation === "sync" ? t("settings.sync.syncing") : t("settings.sync.syncNow")}
             </button>
-            <button className="s-btn" disabled={busy} onClick={() => run("disconnect")}>{t("settings.sync.disconnect")}</button>
+            <button className="s-btn" disabled={active} onClick={() => run("disconnect")}>{t("settings.sync.disconnect")}</button>
           </div>
         </>
       ) : (
         <form onSubmit={(e) => { e.preventDefault(); void run("connect"); }} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <input className="modal-input" style={{ margin: 0 }} type="url" required disabled={busy || status.isPending} value={url} onChange={(e) => setUrl(e.target.value)}
+          <input className="modal-input" style={{ margin: 0 }} type="url" required disabled={active || status.isPending} value={url} onChange={(e) => setUrl(e.target.value)}
             aria-label={t("settings.webdav.url")} placeholder={t("settings.webdav.url")} {...NO_AUTOCORRECT} />
-          <input className="modal-input" style={{ margin: 0 }} disabled={busy} value={username} onChange={(e) => setUsername(e.target.value)}
+          <label htmlFor="webdav-directory">{t("settings.webdav.directory")}</label>
+          <input id="webdav-directory" className="modal-input" style={{ margin: 0 }} disabled={active} value={directory} onChange={(e) => setDirectory(e.target.value)} placeholder="Papr" {...NO_AUTOCORRECT} />
+          <p className="modal-hint">{t("settings.webdav.directoryHint")}</p>
+          <input className="modal-input" style={{ margin: 0 }} disabled={active} value={username} onChange={(e) => setUsername(e.target.value)}
             aria-label={t("settings.sync.userPlaceholder")} placeholder={t("settings.sync.userPlaceholder")} {...NO_AUTOCORRECT} autoComplete="username" />
-          <input className="modal-input" style={{ margin: 0 }} disabled={busy} type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)}
+          <input className="modal-input" style={{ margin: 0 }} disabled={active} type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)}
             aria-label={t("settings.sync.passPlaceholder")} placeholder={t("settings.sync.passPlaceholder")} />
-          <div><button type="submit" className="s-btn primary" disabled={busy || status.isPending || !url.trim()}>
+          <div><button type="submit" className="s-btn primary" disabled={active || status.isPending || !url.trim()}>
             {operation === "connect" ? t("settings.sync.connecting") : t("settings.sync.connect")}
           </button></div>
         </form>
       )}
     </div>
   );
+}
+
+function WebDavNetworkControls({ disabled, onToast }: { disabled: boolean; onToast: (message: string) => void }) {
+  const { t } = useTranslation();
+  const [options, setOptions] = useState<api.WebDavNetworkOptions | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => { let live = true; api.webdavNetworkOptions().then((o) => { if (live) setOptions(o); }).catch(reportError); return () => { live = false; }; }, []);
+  if (!options) return null;
+  const proxyMode = ["inherit", "system", "none"].includes(options.proxy) ? options.proxy : "custom";
+  const save = async () => {
+    setSaving(true);
+    try { await api.webdavSaveNetwork(options); onToast(t("settings.webdav.networkSaved")); }
+    catch (e) { reportError(e); } finally { setSaving(false); }
+  };
+  return <details className="webdav-network">
+    <summary>{t("settings.webdav.network")}</summary>
+    <p className="modal-hint">{t("settings.webdav.networkHint")}</p>
+    <Row label={t("settings.webdav.concurrency")}>
+      <Select disabled={disabled || saving} value={String(options.concurrency)} onChange={(value) => setOptions({ ...options, concurrency: Number(value) })} options={[1, 2, 3, 4, 5, 6, 7, 8].map((n) => ({ value: String(n), label: n === 5 ? t("settings.webdav.defaultConcurrency") : String(n) }))} aria-label={t("settings.webdav.concurrency")} />
+    </Row>
+    <Row label={t("settings.webdav.timeout")}>
+      <Select disabled={disabled || saving} value={String(options.timeoutSecs)} onChange={(value) => setOptions({ ...options, timeoutSecs: Number(value) })} options={[60, 120, 300, 600, 1200, 1800].map((n) => ({ value: String(n), label: t("settings.webdav.timeoutMinutes", { count: n / 60 }) }))} aria-label={t("settings.webdav.timeout")} />
+    </Row>
+    <Row label={t("settings.webdav.proxy")}>
+      <Select disabled={disabled || saving} value={proxyMode} onChange={(value) => setOptions({ ...options, proxy: value === "custom" ? "" : value })} options={[{ value: "inherit", label: t("settings.webdav.proxyInherit") }, { value: "system", label: t("settings.advanced.proxySystem") }, { value: "none", label: t("settings.webdav.proxyNone") }, { value: "custom", label: t("settings.advanced.proxyCustom") }]} aria-label={t("settings.webdav.proxy")} />
+    </Row>
+    {proxyMode === "custom" && <input className="modal-input" value={options.proxy} disabled={disabled || saving} onChange={(e) => setOptions({ ...options, proxy: e.target.value })} placeholder="http://127.0.0.1:7897" aria-label={t("settings.advanced.proxyAddress")} {...NO_AUTOCORRECT} />}
+    {isMobile && proxyMode === "custom" && <p className="modal-hint">{t("settings.webdav.mobileProxyHint")}</p>}
+    <button className="s-btn" disabled={disabled || saving || (proxyMode === "custom" && !options.proxy.trim())} onClick={() => { void save(); }}>{t("common.save")}</button>
+  </details>;
 }
 
 /* ── sync ────────────────────────────────────────────────── */

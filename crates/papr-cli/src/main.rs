@@ -1069,6 +1069,7 @@ async fn cmd_sync(path: &Path, cmd: SyncCmd) -> Result<String, AxiError> {
         }
         SyncCmd::Connect { url, user, password, provider } => {
             if provider.as_deref() == Some("webdav") {
+                let client=papr_core::webdav::http_client(&*dbm.lock().await).map_err(db_err)?;
                 papr_core::webdav::connect(&dbm, &client, &url, &user, &password).await
                     .map_err(|e| clean_err("WebDAV connect failed", e))?;
             } else {
@@ -1088,6 +1089,7 @@ async fn cmd_sync(path: &Path, cmd: SyncCmd) -> Result<String, AxiError> {
         }
         SyncCmd::Run => {
             if papr_core::webdav::status(&dbm).await.map_err(db_err)?.connected {
+                let client=papr_core::webdav::http_client(&*dbm.lock().await).map_err(db_err)?;
                 let n = papr_core::webdav::sync_now(&dbm, &client).await
                     .map_err(|e| clean_err("WebDAV sync failed", e))?;
                 return Ok(Doc::new().set("sync", json!({ "provider": "webdav", "merged": n })).into_toon());

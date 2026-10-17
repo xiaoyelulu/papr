@@ -14,7 +14,16 @@ use tokio::sync::Mutex;
 use url::Url;
 
 mod chunks;
+mod directory;
+pub use directory::{directory_url, relocate};
+mod network;
+mod progress;
+mod transport;
 pub(crate) use chunks::schema as chunk_schema;
+use futures_util::{stream, StreamExt};
+pub use network::client as http_client;
+pub use network::Options as NetworkOptions;
+pub use progress::{cancel, get as progress, Progress};
 
 type Db = Mutex<Connection>;
 const FILE: &str = "papr-library-v1.json";
@@ -40,10 +49,12 @@ pub struct Status {
     pub conflicts: usize,
 }
 
+#[derive(Clone)]
 struct Credentials {
     url: Url,
     user: String,
     password: String,
+    options: NetworkOptions,
 }
 
 fn base_url(input: &str) -> AppResult<Url> {
@@ -56,6 +67,13 @@ fn base_url(input: &str) -> AppResult<Url> {
         || url.fragment().is_some()
     {
         return Err(AppError::code("webdavInvalidUrl"));
+    }
+    if url
+        .host_str()
+        .is_some_and(|h| h.ends_with(".teracloud.jp") || h == "infini-cloud.net")
+        && url.path().starts_with("/browser")
+    {
+        return Err(AppError::code("webdavBrowserUrl"));
     }
     if !url.path().ends_with('/') {
         url.set_path(&format!("{}/", url.path()));
@@ -71,6 +89,7 @@ fn credentials(conn: &Connection) -> AppResult<Option<Credentials>> {
         url: base_url(&url)?,
         user: db::get_setting(conn, "webdav_user")?.unwrap_or_default(),
         password: db::get_setting(conn, "webdav_password")?.unwrap_or_default(),
+        options: NetworkOptions::read(conn)?,
     }))
 }
 
@@ -88,6 +107,8 @@ pub async fn status(db: &Db) -> AppResult<Status> {
             .map(|s| {
                 if s == "webdavNeedsResolution" {
                     "webdavNeedsResolution"
+                } else if s == "webdavRateLimited" {
+                    "webdavRateLimited"
                 } else {
                     "webdavSyncFailed"
                 }
@@ -103,12 +124,13 @@ fn request(
 ) -> reqwest::RequestBuilder {
     http.request(method, url)
         .basic_auth(&c.user, Some(&c.password))
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(c.options.timeout_secs))
 }
 
 fn http_error(status: StatusCode) -> AppError {
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => AppError::code("webdavAuthFailed"),
+        StatusCode::TOO_MANY_REQUESTS => AppError::code("webdavRateLimited"),
         _ => AppError::other(format!("WebDAV: HTTP {status}")),
     }
 }
@@ -121,23 +143,32 @@ fn network_error(e: reqwest::Error) -> AppError {
 
 /// Create only the final directory; the configured parent must already exist.
 async fn ensure_collection(http: &Client, c: &Credentials) -> AppResult<()> {
-    let resp = request(
-        http,
-        c,
-        reqwest::Method::from_bytes(b"MKCOL").unwrap(),
-        c.url.clone(),
-    )
-    .send()
-    .await
-    .map_err(network_error)?;
-    if resp.status().is_success() || resp.status() == StatusCode::METHOD_NOT_ALLOWED {
+    transport::retry(&c.url, || async {
+        let resp = request(
+            http,
+            c,
+            reqwest::Method::from_bytes(b"MKCOL").unwrap(),
+            c.url.clone(),
+        )
+        .send()
+        .await?;
+        if resp.status() == StatusCode::METHOD_NOT_ALLOWED {
+            transport::drain(resp).await;
+            return Ok(());
+        }
+        transport::drain(transport::checked(resp).await?).await;
         Ok(())
-    } else {
-        Err(http_error(resp.status()))
-    }
+    })
+    .await
 }
 
 async fn download(http: &Client, c: &Credentials) -> AppResult<(Root, Option<String>)> {
+    transport::retry(&c.url, || download_once(http, c)).await
+}
+async fn download_once(
+    http: &Client,
+    c: &Credentials,
+) -> transport::Result<(Root, Option<String>)> {
     let mut resp = request(http, c, reqwest::Method::GET, c.url.join(FILE)?)
         .header(header::CACHE_CONTROL, "no-cache")
         .send()
@@ -146,9 +177,7 @@ async fn download(http: &Client, c: &Credentials) -> AppResult<(Root, Option<Str
     if resp.status() == StatusCode::NOT_FOUND {
         return Ok((Root::Manifest(chunks::Manifest::empty()), None));
     }
-    if !resp.status().is_success() {
-        return Err(http_error(resp.status()));
-    }
+    resp = transport::checked(resp).await?;
     let etag = resp
         .headers()
         .get(header::ETAG)
@@ -160,13 +189,14 @@ async fn download(http: &Client, c: &Credentials) -> AppResult<(Root, Option<Str
         .content_length()
         .is_some_and(|n| n > LEGACY_MAX_BYTES as u64)
     {
-        return Err(AppError::code("webdavTooLarge"));
+        return Err(AppError::code("webdavTooLarge").into());
     }
     let mut body = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(network_error)? {
         if body.len() + chunk.len() > LEGACY_MAX_BYTES {
-            return Err(AppError::code("webdavTooLarge"));
+            return Err(AppError::code("webdavTooLarge").into());
         }
+        progress::bytes(chunk.len(), false);
         body.extend_from_slice(&chunk);
     }
     #[derive(Deserialize)]
@@ -177,7 +207,7 @@ async fn download(http: &Client, c: &Credentials) -> AppResult<(Root, Option<Str
         serde_json::from_slice(&body).map_err(|_| AppError::code("webdavInvalidData"))?;
     let root = if matches!(version.version, 6 | 7) {
         if body.len() > 16 * 1024 * 1024 {
-            return Err(AppError::code("webdavTooLarge"));
+            return Err(AppError::code("webdavTooLarge").into());
         }
         let manifest: chunks::Manifest =
             serde_json::from_slice(&body).map_err(|_| AppError::code("webdavInvalidData"))?;
@@ -192,7 +222,7 @@ async fn download(http: &Client, c: &Credentials) -> AppResult<(Root, Option<Str
         replication::upgrade_legacy_folders(&mut snapshot.records)?;
         Root::Legacy(snapshot)
     } else {
-        return Err(AppError::code("webdavVersion"));
+        return Err(AppError::code("webdavVersion").into());
     };
     Ok((root, Some(etag)))
 }
@@ -203,25 +233,39 @@ enum Root {
 }
 
 async fn fetch_chunk(http: &Client, c: &Credentials, p: &chunks::Part) -> AppResult<Vec<u8>> {
-    let mut resp = request(http, c, reqwest::Method::GET, c.url.join(&chunks::path(p))?)
-        .header(header::ACCEPT_ENCODING, "identity")
-        .send()
-        .await
-        .map_err(network_error)?;
-    if !resp.status().is_success() {
-        return Err(http_error(resp.status()));
-    }
-    if resp.content_length().is_some_and(|n| n != p.bytes as u64) {
-        return Err(AppError::code("webdavInvalidData"));
-    }
-    let mut body = Vec::with_capacity(p.bytes);
-    while let Some(b) = resp.chunk().await.map_err(network_error)? {
-        if body.len() + b.len() > p.bytes {
-            return Err(AppError::code("webdavInvalidData"));
+    Ok(fetch_chunk_meta(http, c, p).await?.0)
+}
+async fn fetch_chunk_meta(
+    http: &Client,
+    c: &Credentials,
+    p: &chunks::Part,
+) -> AppResult<(Vec<u8>, Option<String>)> {
+    transport::retry(&c.url, || async {
+        let mut resp = transport::checked(
+            request(http, c, reqwest::Method::GET, c.url.join(&chunks::path(p))?)
+                .header(header::ACCEPT_ENCODING, "identity")
+                .send()
+                .await?,
+        )
+        .await?;
+        let etag = transport::etag(&resp);
+        if resp.content_length().is_some_and(|n| n != p.bytes as u64) {
+            return Err(AppError::code("webdavInvalidData").into());
         }
-        body.extend_from_slice(&b);
-    }
-    Ok(body)
+        let mut body = Vec::with_capacity(p.bytes);
+        while let Some(b) = resp.chunk().await? {
+            if body.len() + b.len() > p.bytes {
+                return Err(AppError::code("webdavInvalidData").into());
+            }
+            progress::bytes(b.len(), false);
+            body.extend_from_slice(&b);
+        }
+        if body.len() != p.bytes {
+            return Err(AppError::code("webdavInvalidData").into());
+        }
+        Ok((body, etag))
+    })
+    .await
 }
 
 /// Verify read and write access using a disposable file. Never upload or merge
@@ -244,6 +288,7 @@ pub async fn connect(
         url: base_url(url)?,
         user: user.trim().into(),
         password: password.into(),
+        options: NetworkOptions::read(&*db.lock().await)?,
     };
     ensure_collection(http, &c).await?;
     download(http, &c).await?;
@@ -252,22 +297,32 @@ pub async fn connect(
         replication::probe_id(&conn)?
     };
     let probe = c.url.join(&format!(".papr-test-{nonce}"))?;
-    let resp = request(http, &c, reqwest::Method::PUT, probe.clone())
-        .header(header::IF_NONE_MATCH, "*")
-        .body("papr")
-        .send()
-        .await
-        .map_err(network_error)?;
-    if !resp.status().is_success() {
-        return Err(http_error(resp.status()));
-    }
-    let resp = request(http, &c, reqwest::Method::DELETE, probe)
-        .send()
-        .await
-        .map_err(network_error)?;
-    if !resp.status().is_success() {
-        return Err(http_error(resp.status()));
-    }
+    transport::retry(&c.url, || async {
+        let resp = request(http, &c, reqwest::Method::PUT, probe.clone())
+            .header(header::IF_NONE_MATCH, "*")
+            .body("papr")
+            .send()
+            .await?;
+        if resp.status() == StatusCode::PRECONDITION_FAILED {
+            transport::drain(resp).await;
+            return Ok(());
+        }
+        transport::drain(transport::checked(resp).await?).await;
+        Ok(())
+    })
+    .await?;
+    transport::retry(&c.url, || async {
+        let resp = request(http, &c, reqwest::Method::DELETE, probe.clone())
+            .send()
+            .await?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            transport::drain(resp).await;
+            return Ok(());
+        }
+        transport::drain(transport::checked(resp).await?).await;
+        Ok(())
+    })
+    .await?;
     let mut conn = db.lock().await;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if db::is_freshrss_connected(&tx) {
@@ -283,6 +338,7 @@ pub async fn connect(
         tx.execute("DELETE FROM webdav_incoming_chunks", [])?;
         tx.execute("DELETE FROM webdav_objects", [])?;
         tx.execute("DELETE FROM webdav_buckets", [])?;
+        tx.execute("DELETE FROM webdav_upload_receipts", [])?;
     }
     for (key, value) in [
         ("webdav_url", c.url.as_str()),
@@ -294,6 +350,7 @@ pub async fn connect(
         db::set_setting(&tx, key, value)?;
     }
     tx.commit()?;
+    progress::clear();
     Ok(())
 }
 
@@ -311,6 +368,7 @@ pub async fn disconnect(db: &Db) -> AppResult<()> {
         db::set_setting(&tx, key, "")?;
     }
     tx.commit()?;
+    progress::clear();
     Ok(())
 }
 
@@ -326,7 +384,9 @@ pub async fn run_if_connected(db: &Db, http: &Client) -> AppResult<bool> {
     if !status(db).await?.connected {
         return Ok(false);
     }
-    sync_now(db, http).await.map(|_| true)
+    let configured = { http_client(&*db.lock().await)? };
+    let _ = http; // caller's feed client may have a different route or stale pool
+    sync_now(db, &configured).await.map(|_| true)
 }
 
 pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
@@ -335,7 +395,7 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
         let conn = db.lock().await;
         credentials(&conn)?.ok_or_else(|| AppError::code("webdavNotConnected"))?
     };
-    let result = sync_inner(db, http, &c).await;
+    let result = progress::run(sync_inner(db, http, &c)).await;
     let conn = db.lock().await;
     match &result {
         Ok(_) => {
@@ -348,6 +408,10 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
                 "webdav_last_error",
                 if matches!(error, AppError::Coded("webdavNeedsResolution")) {
                     "webdavNeedsResolution"
+                } else if matches!(error, AppError::Coded("webdavRateLimited")) {
+                    "webdavRateLimited"
+                } else if matches!(error, AppError::Coded("webdavCancelled")) {
+                    ""
                 } else {
                     "webdavSyncFailed"
                 },
@@ -357,6 +421,129 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
     result
 }
 
+// Both the number of requests and their resident payloads are bounded. A
+// single oversized record runs alone; ordinary chunks can fill five slots.
+const MEMORY_KIB: usize = 96 * 1024;
+fn memory_cost(p: &chunks::Part) -> u32 {
+    ((p.bytes.saturating_mul(2) + p.raw_bytes.saturating_mul(2)).div_ceil(1024))
+        .clamp(1, MEMORY_KIB) as u32
+}
+fn upload_target(c: &Credentials) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::json!([c.url.as_str(), c.user])
+                .to_string()
+                .as_bytes()
+        )
+    )
+}
+async fn save_receipt(
+    db: &Db,
+    target: &str,
+    p: &chunks::Part,
+    etag: Option<String>,
+) -> AppResult<()> {
+    if let Some(etag) = etag {
+        db.lock().await.execute("INSERT INTO webdav_upload_receipts(target,hash,bytes,etag) VALUES(?1,?2,?3,?4) ON CONFLICT(target,hash) DO UPDATE SET bytes=excluded.bytes,etag=excluded.etag",rusqlite::params![target,p.hash,p.bytes,etag])?;
+    }
+    Ok(())
+}
+async fn receipt_valid(
+    db: &Db,
+    http: &Client,
+    c: &Credentials,
+    p: &chunks::Part,
+    target: &str,
+) -> AppResult<bool> {
+    use rusqlite::OptionalExtension;
+    let receipt: Option<String> = db
+        .lock()
+        .await
+        .query_row(
+            "SELECT etag FROM webdav_upload_receipts WHERE target=?1 AND hash=?2 AND bytes=?3",
+            rusqlite::params![target, p.hash, p.bytes],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(receipt) = receipt {
+        let resp = transport::retry(&c.url, || async {
+            let r = request(
+                http,
+                c,
+                reqwest::Method::HEAD,
+                c.url.join(&chunks::path(p))?,
+            )
+            .header(header::ACCEPT_ENCODING, "identity")
+            .send()
+            .await?;
+            if matches!(r.status().as_u16(), 404 | 405 | 501) {
+                return Ok(r);
+            }
+            transport::checked(r).await
+        })
+        .await?;
+        let unchanged = resp.status().is_success()
+            && transport::etag(&resp).as_deref() == Some(&receipt)
+            && resp
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<usize>().ok())
+                == Some(p.bytes);
+        transport::drain(resp).await;
+        if unchanged {
+            return Ok(true);
+        }
+        db.lock().await.execute(
+            "DELETE FROM webdav_upload_receipts WHERE target=?1 AND hash=?2",
+            rusqlite::params![target, p.hash],
+        )?;
+    }
+    Ok(false)
+}
+async fn upload_chunk(
+    db: &Db,
+    http: &Client,
+    c: &Credentials,
+    p: &chunks::Part,
+    target: &str,
+) -> AppResult<()> {
+    if receipt_valid(db, http, c, p, target).await? {
+        return Ok(());
+    }
+    let body: bytes::Bytes = chunks::cached(&*db.lock().await, p)?
+        .ok_or_else(|| AppError::code("webdavInvalidData"))?
+        .into();
+    let resp = transport::retry(&c.url, || async {
+        let resp = request(http, c, reqwest::Method::PUT, c.url.join(&chunks::path(p))?)
+            .header(header::IF_NONE_MATCH, "*")
+            .header(header::CONTENT_TYPE, "application/gzip")
+            .header(header::CONTENT_LENGTH, p.bytes)
+            .body(transport::upload_body(body.clone()))
+            .send()
+            .await?;
+        if resp.status() == StatusCode::PRECONDITION_FAILED {
+            return Ok(resp);
+        }
+        transport::checked(resp).await
+    })
+    .await?;
+    if resp.status() == StatusCode::PRECONDITION_FAILED {
+        transport::drain(resp).await;
+        // No trustworthy local upload receipt: verify the actual content.
+        let (bytes, etag) = fetch_chunk_meta(http, c, p).await?;
+        chunks::cache(&*db.lock().await, p, &bytes)?;
+        save_receipt(db, target, p, etag).await?;
+    } else {
+        let etag = transport::etag(&resp);
+        transport::drain(resp).await;
+        save_receipt(db, target, p, etag).await?;
+    }
+    Ok(())
+}
+
 async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize> {
     let mut total = 0;
     for _ in 0..3 {
@@ -364,19 +551,47 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
         match &remote {
             Root::Legacy(snapshot) => chunks::stage_legacy(&mut *db.lock().await, snapshot)?,
             Root::Manifest(manifest) => {
-                for p in &manifest.chunks {
-                    let present = chunks::available(&*db.lock().await, p)?;
-                    if !present {
-                        let body = fetch_chunk(http, c, p).await?;
-                        chunks::cache(&*db.lock().await, p, &body)?;
-                    }
+                let pending = {
+                    let conn = db.lock().await;
+                    manifest
+                        .chunks
+                        .iter()
+                        .filter_map(|p| match chunks::available(&conn, p) {
+                            Ok(false) => Some(Ok(p.clone())),
+                            Ok(true) => None,
+                            Err(e) => Some(Err(e)),
+                        })
+                        .collect::<AppResult<Vec<_>>>()?
+                };
+                progress::phase("download", pending.len());
+                let memory = tokio::sync::Semaphore::new(MEMORY_KIB);
+                let mut jobs = stream::iter(pending)
+                    .map(|p| {
+                        let memory = &memory;
+                        async move {
+                            let _permit = memory
+                                .acquire_many(memory_cost(&p))
+                                .await
+                                .expect("sync memory semaphore");
+                            let body = fetch_chunk(http, c, &p).await?;
+                            chunks::cache(&*db.lock().await, &p, &body)?;
+                            progress::completed();
+                            Ok::<_, AppError>(())
+                        }
+                    })
+                    .buffer_unordered(c.options.concurrency);
+                while let Some(result) = jobs.next().await {
+                    result?;
                 }
+                progress::phase("staging", 0);
                 chunks::stage(&mut *db.lock().await, manifest)?;
             }
         }
         let outgoing = {
             let mut conn = db.lock().await;
+            progress::phase("merging", 0);
             total += replication::merge_staged(&mut conn)?;
+            progress::phase("exporting", 0);
             chunks::export(&mut conn)?
         };
         let remote_parts = match &remote {
@@ -390,32 +605,43 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
         if etag.is_some() && matches!(&remote,Root::Manifest(m) if *m==outgoing) {
             chunks::acknowledge(&*db.lock().await)?;
             chunks::prune(&*db.lock().await)?;
+            db.lock().await.execute(
+                "DELETE FROM webdav_upload_receipts WHERE target=?1",
+                [upload_target(c)],
+            )?;
             return Ok(total);
         }
         // Publish immutable objects first. A partial upload cannot expose an
         // incomplete snapshot; the old conditional root remains authoritative.
-        for p in &outgoing.chunks {
-            if remote_parts.contains(p.hash.as_str()) {
-                continue;
-            }
-            let body = chunks::cached(&*db.lock().await, p)?
-                .ok_or_else(|| AppError::code("webdavInvalidData"))?;
-            let resp = request(http, c, reqwest::Method::PUT, c.url.join(&chunks::path(p))?)
-                .header(header::IF_NONE_MATCH, "*")
-                .header(header::CONTENT_TYPE, "application/gzip")
-                .body(body)
-                .send()
-                .await
-                .map_err(network_error)?;
-            if resp.status() == StatusCode::PRECONDITION_FAILED {
-                // Existing content-addressed objects are reusable only after
-                // verifying their actual bytes (also resumes interrupted runs).
-                let body = fetch_chunk(http, c, p).await?;
-                chunks::cache(&*db.lock().await, p, &body)?;
-            } else if !resp.status().is_success() {
-                return Err(http_error(resp.status()));
-            }
+        let pending: Vec<_> = outgoing
+            .chunks
+            .iter()
+            .filter(|p| !remote_parts.contains(p.hash.as_str()))
+            .cloned()
+            .collect();
+        progress::phase("upload", pending.len());
+        let memory = tokio::sync::Semaphore::new(MEMORY_KIB);
+        let target = upload_target(c);
+        let mut jobs = stream::iter(pending)
+            .map(|p| {
+                let memory = &memory;
+                let target = &target;
+                async move {
+                    let _permit = memory
+                        .acquire_many(memory_cost(&p))
+                        .await
+                        .expect("sync memory semaphore");
+                    upload_chunk(db, http, c, &p, target).await?;
+                    progress::completed();
+                    Ok::<_, AppError>(())
+                }
+            })
+            .buffer_unordered(c.options.concurrency);
+        while let Some(result) = jobs.next().await {
+            result?;
         }
+        drop(jobs);
+        progress::phase("publishing", 0);
         let body =
             serde_json::to_vec(&outgoing).map_err(|_| AppError::code("webdavInvalidData"))?;
         if body.len() > 16 * 1024 * 1024 {
@@ -428,18 +654,37 @@ async fn sync_inner(db: &Db, http: &Client, c: &Credentials) -> AppResult<usize>
         } else {
             req.header(header::IF_NONE_MATCH, "*")
         };
-        let resp = req.body(body).send().await.map_err(network_error)?;
+        let resp = transport::retry(&c.url, || async {
+            progress::bytes(body.len(), true);
+            let resp = req
+                .try_clone()
+                .expect("clone manifest request")
+                .body(body.clone())
+                .send()
+                .await?;
+            if matches!(
+                resp.status(),
+                StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT
+            ) {
+                return Ok(resp);
+            }
+            transport::checked(resp).await
+        })
+        .await?;
         if matches!(
             resp.status(),
             StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT
         ) {
+            transport::drain(resp).await;
             continue;
         }
-        if !resp.status().is_success() {
-            return Err(http_error(resp.status()));
-        }
+        transport::drain(resp).await;
         chunks::acknowledge(&*db.lock().await)?;
         chunks::prune(&*db.lock().await)?;
+        db.lock().await.execute(
+            "DELETE FROM webdav_upload_receipts WHERE target=?1",
+            [&target],
+        )?;
         return Ok(total);
     }
     Err(AppError::code("webdavConflict"))
@@ -458,6 +703,8 @@ mod tests {
         objects: std::collections::BTreeMap<String, Vec<u8>>,
         chunk_gets: usize,
         chunk_puts: usize,
+        chunk_heads: usize,
+        chunk_copies: usize,
         revision: u64,
         conflict: bool,
         missing_etag: bool,
@@ -465,6 +712,186 @@ mod tests {
         fail_upload: bool,
         fail_root: bool,
         conditional_writes: usize,
+        delay_ms: u64,
+        active: usize,
+        max_active: usize,
+        transient: usize,
+        throttles: usize,
+        copy_unsupported: bool,
+        copy_fail_after: Option<usize>,
+        change_source_during_copy: bool,
+    }
+    fn object_etag(body: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("\"{:x}\"", Sha256::digest(body))
+    }
+    fn handle(
+        s: &mut Server,
+        method: &str,
+        path: &str,
+        headers: &str,
+        bytes: &[u8],
+    ) -> (u16, Option<String>, Vec<u8>) {
+        let object = path.contains("papr-chunk-v6-");
+        let primary = path == "/papr/papr-library-v1.json";
+        let hdr = |key: &str| {
+            headers.lines().find_map(|line| {
+                line.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| v.trim().to_string())
+            })
+        };
+        if s.deny {
+            return (401, None, Vec::new());
+        }
+        if method == "MKCOL" {
+            return (405, None, Vec::new());
+        }
+        if path.contains(".papr-test-") {
+            return (if method == "PUT" { 201 } else { 204 }, None, Vec::new());
+        }
+        if object && s.transient > 0 {
+            s.transient -= 1;
+            s.throttles += 1;
+            return (429, None, Vec::new());
+        }
+        if method == "COPY" {
+            if s.copy_unsupported {
+                return (405, None, Vec::new());
+            }
+            if object
+                && s.copy_fail_after
+                    .is_some_and(|limit| s.chunk_copies >= limit)
+            {
+                return (500, None, Vec::new());
+            }
+            assert_eq!(hdr("Overwrite").as_deref(), Some("F"));
+            let destination = Url::parse(&hdr("Destination").unwrap())
+                .unwrap()
+                .path()
+                .to_owned();
+            if s.objects.contains_key(&destination) {
+                return (412, None, Vec::new());
+            }
+            let source = if primary {
+                s.body.clone()
+            } else {
+                s.objects.get(path).cloned()
+            };
+            let Some(source) = source else {
+                return (404, None, Vec::new());
+            };
+            if primary && hdr("If-Match").as_deref() != Some(format!("\"{}\"", s.revision).as_str())
+            {
+                return (412, None, Vec::new());
+            }
+            if primary && s.fail_root {
+                return (500, None, Vec::new());
+            }
+            if object {
+                s.chunk_copies += 1;
+                if s.change_source_during_copy {
+                    s.revision += 1;
+                    s.change_source_during_copy = false;
+                }
+            } else {
+                let m: chunks::Manifest = serde_json::from_slice(&source).unwrap();
+                let directory = destination.strip_suffix(FILE).unwrap();
+                assert!(
+                    m.chunks.iter().all(|p| s
+                        .objects
+                        .contains_key(&format!("{directory}{}", chunks::path(p)))),
+                    "Root copied before all chunks"
+                );
+            }
+            let etag = object_etag(&source);
+            s.objects.insert(destination, source);
+            return (201, Some(etag), Vec::new());
+        }
+        if object {
+            if method == "GET" || method == "HEAD" {
+                if method == "GET" {
+                    s.chunk_gets += 1;
+                } else {
+                    s.chunk_heads += 1;
+                }
+                return match s.objects.get(path) {
+                    Some(b) => (200, Some(object_etag(b)), b.clone()),
+                    None => (404, None, Vec::new()),
+                };
+            }
+            if method == "PUT" {
+                assert_eq!(hdr("If-None-Match").as_deref(), Some("*"));
+                s.chunk_puts += 1;
+                if s.fail_upload {
+                    return (500, None, Vec::new());
+                }
+                if s.objects.contains_key(path) {
+                    return (412, None, Vec::new());
+                }
+                let etag = object_etag(bytes);
+                s.objects.insert(path.into(), bytes.to_vec());
+                return (201, Some(etag), Vec::new());
+            }
+        } else if method == "GET" {
+            let body = if primary {
+                s.body.clone()
+            } else {
+                s.objects.get(path).cloned()
+            };
+            return match body {
+                Some(body) => {
+                    let etag = if s.missing_etag {
+                        None
+                    } else if primary {
+                        Some(format!("\"{}\"", s.revision))
+                    } else {
+                        Some(object_etag(&body))
+                    };
+                    (200, etag, body)
+                }
+                None => (404, None, Vec::new()),
+            };
+        } else if method == "PUT" {
+            let current = if primary {
+                s.body.as_ref()
+            } else {
+                s.objects.get(path)
+            };
+            let expected = if current.is_some() {
+                format!(
+                    "if-match: {}",
+                    if primary {
+                        format!("\"{}\"", s.revision)
+                    } else {
+                        object_etag(current.unwrap())
+                    }
+                )
+            } else {
+                "if-none-match: *".into()
+            };
+            assert!(
+                headers.to_ascii_lowercase().contains(&expected),
+                "Missing condition: {headers}"
+            );
+            s.conditional_writes += 1;
+            if s.fail_upload || s.fail_root {
+                return (500, None, Vec::new());
+            }
+            if s.conflict {
+                s.conflict = false;
+                s.revision += 1;
+                return (412, None, Vec::new());
+            }
+            if primary {
+                s.body = Some(bytes.to_vec());
+                s.revision += 1;
+            } else {
+                s.objects.insert(path.into(), bytes.to_vec());
+            }
+            return (201, None, Vec::new());
+        }
+        (400, None, Vec::new())
     }
     async fn server() -> (String, Arc<StdMutex<Server>>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -474,115 +901,76 @@ mod tests {
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut bytes = Vec::new();
-                let end = loop {
-                    let mut buf = [0; 4096];
-                    let n = socket.read(&mut buf).await.unwrap();
-                    if n == 0 {
-                        break None;
-                    }
-                    bytes.extend_from_slice(&buf[..n]);
-                    if let Some(p) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
-                        break Some(p + 4);
-                    }
-                };
-                let Some(end) = end else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&bytes[..end]).to_string();
-                let length = headers
-                    .lines()
-                    .find_map(|l| {
-                        l.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                while bytes.len() < end + length {
-                    let mut buf = [0; 4096];
-                    let n = socket.read(&mut buf).await.unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    bytes.extend_from_slice(&buf[..n]);
-                }
-                let (code, etag, body) = {
-                    let mut s = shared.lock().unwrap();
-                    let method = headers.split_whitespace().next().unwrap();
-                    let path = headers.split_whitespace().nth(1).unwrap().to_string();
-                    let object = path.contains("papr-chunk-v6-");
-                    let probe = headers.lines().next().unwrap().contains(".papr-test-");
-                    if s.deny {
-                        (401, None, Vec::new())
-                    } else if method == "MKCOL" {
-                        (405, None, Vec::new())
-                    } else if probe {
-                        (if method == "PUT" { 201 } else { 204 }, None, Vec::new())
-                    } else if object {
-                        if method == "GET" {
-                            s.chunk_gets += 1;
-                            match s.objects.get(&path) {
-                                Some(b) => (200, None, b.clone()),
-                                None => (404, None, Vec::new()),
-                            }
-                        } else if method == "PUT" {
-                            assert!(headers.to_ascii_lowercase().contains("if-none-match: *"));
-                            s.chunk_puts += 1;
-                            if s.fail_upload || s.fail_root {
-                                (500, None, Vec::new())
-                            } else if s.objects.contains_key(&path) {
-                                (412, None, Vec::new())
-                            } else {
-                                s.objects.insert(path, bytes[end..end + length].to_vec());
-                                (201, None, Vec::new())
-                            }
-                        } else {
-                            (400, None, Vec::new())
-                        }
-                    } else if method == "GET" {
-                        match s.body.clone() {
-                            Some(body) => (
-                                200,
-                                if s.missing_etag {
-                                    None
-                                } else {
-                                    Some(format!("\"{}\"", s.revision))
-                                },
-                                body,
-                            ),
-                            None => (404, None, Vec::new()),
-                        }
-                    } else if method == "PUT" {
-                        let lower = headers.to_ascii_lowercase();
-                        s.conditional_writes += 1;
-                        let expected = if s.body.is_some() {
-                            format!("if-match: \"{}\"", s.revision)
-                        } else {
-                            "if-none-match: *".into()
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let end = loop {
+                        let mut buf = [0; 4096];
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
                         };
-                        assert!(lower.contains(&expected), "Missing condition: {headers}");
-                        if s.fail_upload || s.fail_root {
-                            (500, None, Vec::new())
-                        } else if s.conflict {
-                            s.conflict = false;
-                            s.revision += 1;
-                            (412, None, Vec::new())
-                        } else {
-                            s.body = Some(bytes[end..end + length].to_vec());
-                            s.revision += 1;
-                            (201, None, Vec::new())
+                        if n == 0 {
+                            return;
                         }
-                    } else {
-                        (400, None, Vec::new())
+                        bytes.extend_from_slice(&buf[..n]);
+                        if let Some(p) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                            break p + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_string();
+                    let method = headers.split_whitespace().next().unwrap();
+                    let path = headers.split_whitespace().nth(1).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    while bytes.len() < end + length {
+                        let mut buf = [0; 4096];
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buf[..n]);
                     }
-                };
-                let etag = etag.map(|s| format!("ETag: {s}\r\n")).unwrap_or_default();
-                let response = format!(
-                    "HTTP/1.1 {code} Test\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-                socket.write_all(&body).await.unwrap();
+                    let object = path.contains("papr-chunk-v6-");
+                    let delay = {
+                        let mut s = shared.lock().unwrap();
+                        if object {
+                            s.active += 1;
+                            s.max_active = s.max_active.max(s.active);
+                        }
+                        s.delay_ms
+                    };
+                    if object && delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let (code, etag, body) = {
+                        let mut s = shared.lock().unwrap();
+                        let result =
+                            handle(&mut s, method, path, &headers, &bytes[end..end + length]);
+                        if object {
+                            s.active -= 1;
+                        }
+                        result
+                    };
+                    let etag = etag.map(|s| format!("ETag: {s}\r\n")).unwrap_or_default();
+                    let retry = if code == 429 {
+                        "Retry-After: 0\r\n"
+                    } else {
+                        ""
+                    };
+                    let response=format!("HTTP/1.1 {code} Test\r\n{etag}{retry}Content-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    if method != "HEAD" {
+                        let _ = socket.write_all(&body).await;
+                    }
+                });
             }
         });
         (url, state, task)
@@ -607,6 +995,249 @@ mod tests {
         .unwrap();
         db::set_read(&conn, 1, true).unwrap();
     }
+    async fn many(db: &Db) {
+        seed(db).await;
+        let c = db.lock().await;
+        for i in 0..36 {
+            c.execute("INSERT INTO articles(feed_id,guid,title,body_text) VALUES(1,?1,'Test article','A sample body for the latency test')",[format!("parallel-{i}")]).unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn bounded_parallelism_retries_and_receipts_avoid_repeated_body_transfers() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        many(&a).await;
+        db::set_setting(&*a.lock().await, "webdav_concurrency", "1").unwrap();
+        connect(&a, &http, &url, "u", "p").await.unwrap();
+        server.lock().unwrap().delay_ms = 15;
+        let start = std::time::Instant::now();
+        sync_now(&a, &http).await.unwrap();
+        let serial = start.elapsed();
+        assert_eq!(server.lock().unwrap().max_active, 1);
+        {
+            let mut s = server.lock().unwrap();
+            s.body = None;
+            s.objects.clear();
+            s.max_active = 0;
+            s.transient = 1;
+        }
+        db::set_setting(&*a.lock().await, "webdav_concurrency", "5").unwrap();
+        let start = std::time::Instant::now();
+        sync_now(&a, &http).await.unwrap();
+        let parallel = start.elapsed();
+        {
+            let s = server.lock().unwrap();
+            assert_eq!(s.max_active, 5);
+            assert_eq!(s.throttles, 1);
+        }
+        println!(
+            "15 ms/request fixture: serial {:?}, five parallel {:?}",
+            serial, parallel
+        );
+        replication::set_progress(&*a.lock().await, 1, 0.7).unwrap();
+        server.lock().unwrap().fail_root = true;
+        assert!(sync_now(&a, &http).await.is_err());
+        let (gets, puts) = {
+            let s = server.lock().unwrap();
+            (s.chunk_gets, s.chunk_puts)
+        };
+        server.lock().unwrap().fail_root = false;
+        sync_now(&a, &http).await.unwrap();
+        {
+            let s = server.lock().unwrap();
+            assert!(s.chunk_heads > 0);
+            assert_eq!(
+                s.chunk_gets, gets,
+                "resume must not redownload verified upload bodies"
+            );
+            assert_eq!(s.chunk_puts, puts);
+        }
+        let b = database();
+        db::set_setting(&*b.lock().await, "webdav_concurrency", "3").unwrap();
+        connect(&b, &http, &url, "u", "p").await.unwrap();
+        server.lock().unwrap().max_active = 0;
+        sync_now(&b, &http).await.unwrap();
+        assert_eq!(server.lock().unwrap().max_active, 3);
+        assert_eq!(
+            db::get_article(&*b.lock().await, 1)
+                .unwrap()
+                .reading_progress,
+            0.7
+        );
+        task.abort();
+    }
+    #[tokio::test]
+    async fn changed_etag_never_reuses_a_corrupt_previously_uploaded_object() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        seed(&a).await;
+        connect(&a, &http, &url, "u", "p").await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        replication::set_progress(&*a.lock().await, 1, 0.75).unwrap();
+        server.lock().unwrap().fail_root = true;
+        assert!(sync_now(&a, &http).await.is_err());
+        let (hash, bytes): (String, usize) = a
+            .lock()
+            .await
+            .query_row(
+                "SELECT hash,bytes FROM webdav_upload_receipts LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let path = format!("/papr/papr-chunk-v6-{hash}.jsonl.gz");
+        let original = server
+            .lock()
+            .unwrap()
+            .objects
+            .insert(path.clone(), vec![b'x'; bytes])
+            .unwrap();
+        server.lock().unwrap().fail_root = false;
+        let root = server.lock().unwrap().body.clone();
+        assert!(matches!(
+            sync_now(&a, &http).await,
+            Err(AppError::Coded("webdavInvalidData"))
+        ));
+        assert_eq!(server.lock().unwrap().body, root);
+        server.lock().unwrap().objects.insert(path, original);
+        sync_now(&a, &http).await.unwrap();
+        task.abort();
+    }
+    #[tokio::test]
+    async fn server_side_directory_copy_is_conditional_keeps_source_and_pending_local_edits() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        seed(&a).await;
+        connect(&a, &http, &url, "u", "p").await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        let before = {
+            let mut s = server.lock().unwrap();
+            s.objects
+                .insert("/papr/unrelated.txt".into(), b"keep me".to_vec());
+            s.change_source_during_copy = true;
+            (s.body.clone(), s.chunk_gets, s.chunk_puts)
+        };
+        replication::set_progress(&*a.lock().await, 1, 0.4).unwrap();
+        let target = relocate(&a, &http, "Papr").await.unwrap();
+        assert_eq!(target, format!("{url}Papr/"));
+        {
+            let s = server.lock().unwrap();
+            assert_eq!(s.body, before.0);
+            assert!(s.chunk_copies > 0);
+            assert!(s.chunk_heads > 0);
+            assert_eq!(s.chunk_gets, before.1);
+            assert_eq!(s.chunk_puts, before.2);
+            assert_eq!(s.objects["/papr/unrelated.txt"], b"keep me");
+        }
+        sync_now(&a, &http).await.unwrap();
+        let b = database();
+        connect(&b, &http, &target, "u", "p").await.unwrap();
+        sync_now(&b, &http).await.unwrap();
+        assert_eq!(
+            db::get_article(&*b.lock().await, 1)
+                .unwrap()
+                .reading_progress,
+            0.4
+        );
+        assert_eq!(server.lock().unwrap().body, before.0);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn directory_copy_can_resume_and_refuses_another_library() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        seed(&a).await;
+        connect(&a, &http, &url, "u", "p").await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        server.lock().unwrap().copy_fail_after = Some(2);
+        assert!(relocate(&a, &http, "New").await.is_err());
+        assert_eq!(status(&a).await.unwrap().url.as_deref(), Some(url.as_str()));
+        assert!(!server
+            .lock()
+            .unwrap()
+            .objects
+            .contains_key("/papr/New/papr-library-v1.json"));
+        server.lock().unwrap().copy_fail_after = None;
+        let target = relocate(&a, &http, "New").await.unwrap();
+        assert_eq!(
+            status(&a).await.unwrap().url.as_deref(),
+            Some(target.as_str())
+        );
+        server.lock().unwrap().objects.insert(
+            "/papr/New/Occupied/papr-library-v1.json".into(),
+            serde_json::to_vec(&chunks::Manifest::empty()).unwrap(),
+        );
+        assert!(matches!(
+            relocate(&a, &http, "Occupied").await,
+            Err(AppError::Coded("webdavDirectoryOccupied"))
+        ));
+        assert_eq!(
+            status(&a).await.unwrap().url.as_deref(),
+            Some(target.as_str())
+        );
+        task.abort();
+    }
+    #[tokio::test]
+    async fn copy_unsupported_falls_back_to_bounded_chunk_uploads() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = database();
+        seed(&a).await;
+        connect(&a, &http, &url, "u", "p").await.unwrap();
+        sync_now(&a, &http).await.unwrap();
+        server.lock().unwrap().copy_unsupported = true;
+        let original = server.lock().unwrap().body.clone();
+        let target = relocate(&a, &http, "Fallback").await.unwrap();
+        let b = database();
+        connect(&b, &http, &target, "u", "p").await.unwrap();
+        sync_now(&b, &http).await.unwrap();
+        assert_eq!(
+            db::get_article(&*b.lock().await, 1).unwrap().title,
+            "Article"
+        );
+        assert_eq!(server.lock().unwrap().body, original);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn cancellation_keeps_the_published_root_intact_and_can_resume() {
+        let (url, server, task) = server().await;
+        let http = client();
+        let a = Arc::new(database());
+        many(&a).await;
+        connect(&a, &http, &url, "u", "p").await.unwrap();
+        server.lock().unwrap().delay_ms = 300;
+        let run = {
+            let a = a.clone();
+            let http = http.clone();
+            tokio::spawn(async move { sync_now(&a, &http).await })
+        };
+        tokio::time::timeout(Duration::from_secs(90), async {
+            loop {
+                if server.lock().unwrap().active > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(progress().running);
+        cancel();
+        assert!(matches!(
+            run.await.unwrap(),
+            Err(AppError::Coded("webdavCancelled"))
+        ));
+        assert!(server.lock().unwrap().body.is_none());
+        server.lock().unwrap().delay_ms = 0;
+        sync_now(&a, &http).await.unwrap();
+        assert!(server.lock().unwrap().body.is_some());
+        task.abort();
+    }
+
     #[tokio::test]
     async fn two_devices_merge_over_http_and_retry_conditional_conflicts() {
         let (url, server, task) = server().await;

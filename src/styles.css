@@ -1965,7 +1965,7 @@ button { font-family: inherit; }
 }
 .s-service .info { flex: 1; min-width: 0; }
 .s-service .info .title { font-size: 14px; font-weight: 600; color: var(--ink); }
-.s-service .info .desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.s-service .info .desc { font-size: 12px; color: var(--muted); margin-top: 2px; overflow-wrap: anywhere; }
 .s-service .status {
   font-size: 11.5px;
   padding: 3px 8px;
@@ -3266,3 +3266,16 @@ button { font-family: inherit; }
 .ctx-label { flex:1; min-width:0; }
 .ctx-description { display:block; max-width:min(330px,calc(100vw - 80px)); padding-top:5px; font-size:12px; line-height:1.5; color:var(--muted); white-space:normal; overflow-wrap:anywhere; user-select:text; }
 :root[data-platform="mobile"] .s-feed-row .actions .icon-btn { min-width:36px; min-height:36px; }
+
+.webdav-network { margin: 12px 0 16px; border: 1px solid var(--hair); border-radius: 8px; padding: 12px; }
+.webdav-network summary { cursor: pointer; color: var(--ink); font-weight: 500; }
+.webdav-network .s-select { max-width: 100%; }
+.webdav-progress { border: 1px solid var(--hair); border-radius: 8px; padding: 12px; margin: 12px 0; overflow-wrap: anywhere; }
+.webdav-progress progress { width: 100%; display: block; margin: 10px 0 4px; accent-color: var(--accent); }
+.webdav-progress p { color: var(--muted); font-size: 12px; margin: 6px 0; }
+.webdav-directory { padding: 14px 0; border-top: 1px solid var(--hair); margin-top: 14px; }
+.webdav-directory label { display: block; font-size: 13px; font-weight: 500; }
+.webdav-directory .modal-input { width: 100%; box-sizing: border-box; }
+.webdav-path { color: var(--muted); overflow-wrap: anywhere; font-size: 12px; }
+.webdav-help { margin: 12px 0; color: var(--muted); font-size: 12px; }
+.webdav-help summary { cursor: pointer; }

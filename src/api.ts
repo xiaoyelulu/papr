@@ -418,8 +418,8 @@ export interface WebDavConflict { kind: string; key: string; local: WebDavRecord
 export const webdavConflicts = () => invoke<WebDavConflict[]>("webdav_conflicts");
 export const webdavResolve = (kind: string, key: string, choice: "local" | "remote" | "newer" | "root") => invoke<void>("webdav_resolve", { kind, key, choice });
 export const webdavStatus = () => invoke<WebDavStatus>("webdav_status");
-export const webdavConnect = (url: string, username: string, password: string) =>
-  invoke<void>("webdav_connect", { url, username, password });
+export const webdavConnect = (url: string, username: string, password: string, directory = "Papr") =>
+  invoke<void>("webdav_connect", { url, username, password, directory });
 export const webdavDisconnect = () => invoke<void>("webdav_disconnect");
 export const webdavSync = () => invoke<number>("webdav_sync");
 export const setReadingProgress = (id: number, progress: number) =>
@@ -431,3 +431,11 @@ export interface FeedCleanupPlan { total: number; remove: number; protected: num
 export const previewFeedCleanup = (id: number) => invoke<FeedCleanupPlan>("preview_feed_cleanup", { id });
 export const cleanupFeedArticles = (id: number, token: string, automatic: boolean) => invoke<number>("cleanup_feed_articles", { id, token, automatic });
 export const disableFeedLimit = (id: number) => invoke<void>("disable_feed_limit", { id });
+
+export interface WebDavNetworkOptions { concurrency: number; timeoutSecs: number; proxy: string }
+export interface WebDavProgress { running: boolean; phase: string; completed: number; total: number; downloaded: number; uploaded: number; bytesPerSecond: number; retries: number; elapsedMs: number }
+export const webdavNetworkOptions = () => invoke<WebDavNetworkOptions>("webdav_network_options");
+export const webdavSaveNetwork = (options: WebDavNetworkOptions) => invoke<void>("webdav_save_network", { options });
+export const webdavProgress = () => invoke<WebDavProgress>("webdav_progress");
+export const webdavCancel = () => invoke<void>("webdav_cancel");
+export const webdavRelocate = (directory: string) => invoke<string>("webdav_relocate", { directory });

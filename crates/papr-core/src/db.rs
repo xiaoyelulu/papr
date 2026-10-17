@@ -317,6 +317,7 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
         M::up(crate::webdav::chunk_schema()),
         M::up("CREATE TABLE webdav_folder_scope_upgrade(id INTEGER PRIMARY KEY); INSERT INTO webdav_folder_scope_upgrade VALUES(1);"),
         M::up(webdav::feed_retention_schema()),
+        M::up("CREATE TABLE webdav_upload_receipts(target TEXT NOT NULL,hash TEXT NOT NULL,bytes INTEGER NOT NULL,etag TEXT NOT NULL,PRIMARY KEY(target,hash));"),
     ])
 });
 
@@ -2830,28 +2831,28 @@ mod tests {
     }
     #[test]
     fn startup_migrations_preserve_existing_databases() {
-        for version in [0, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30] {
+        for version in [0, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] {
             let path = std::env::temp_dir().join(format!("papr-migrations-{}-{}-{}.db",
                 std::process::id(), version,
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             let mut conn = Connection::open(&path).unwrap();
-            MIGRATIONS.to_version(&mut conn, version.min(29)).unwrap();
+            MIGRATIONS.to_version(&mut conn, version.min(30)).unwrap();
             if version > 0 {
                 conn.execute("INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.com/rss','Preserved')", []).unwrap();
                 conn.execute("INSERT INTO articles(feed_id,guid,title,is_starred) VALUES(1,'one','Article',1)", []).unwrap();
             }
             if version >= 20 { conn.execute("UPDATE feeds SET custom_favicon=1", []).unwrap(); }
             if version >= 21 { conn.execute("UPDATE feeds SET position=42", []).unwrap(); }
-            if version == 30 { conn.pragma_update(None, "user_version", 30).unwrap(); }
+            if version == 31 { conn.pragma_update(None, "user_version", 31).unwrap(); }
             drop(conn);
             let result = open(&path);
-            if version == 30 {
+            if version == 31 {
                 assert!(result.is_err());
                 let conn = Connection::open(&path).unwrap();
-                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 30);
+                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 31);
             } else {
                 let conn = result.unwrap();
-                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 29);
+                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 30);
                 if version > 0 {
                     let values: (String,i64,i64) = conn.query_row("SELECT title,custom_favicon,position FROM feeds WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
                     assert_eq!(values, ("Preserved".into(), i64::from(version>=20), if version>=21 {42} else {0}));
